@@ -24,7 +24,7 @@ SUMMARY
     Unfixable incompatibilities ....... 0  (in the top-50 sweep; see INCOMPATIBLE for those
                                           found later outside it)
   Found later, outside this run ....... 9  (ModernFix, singleplayer only — FIXED;
-                                          CBC Neo Warfare — NOT SUPPORTED, by choice;
+                                          CBC Neo Warfare 0.0.6v — PATCHED, runtime pending;
                                           Twilight Forest — FIXED;
                                           Voxy via Roxy, client only — FIXED;
                                           Distant Horizons chunk-IO thread leak — FIXED;
@@ -927,16 +927,15 @@ INCOMPATIBLE  (unfixable)
     same mixins applying twice. (VMP is also bundled; not declared, as no 1.21.1 jar was at hand to
     reproduce with.)
 
-  cbcmodernwarfare ...... CBC Neo Warfare 0.0.6v ................ NOT SUPPORTED, by choice
+=============================================================
+STATIC PATCHED — RUNTIME PENDING
+=============================================================
+  cbcmodernwarfare ...... CBC Neo Warfare 0.0.6v ................ PATCHED; runtime pending
 
-    A NeoForge port of CBC: Modern Warfare made against the original authors' wishes, so SuperChunk
-    does not carry compatibility for it. The server crashes when ChunkMap first loads: its camera
-    mixin's @ModifyExpressionValue on getLastSectionPos() in ChunkMap.getPlayers cannot apply over
-    bundled VMP's getPlayers overwrite at priority 1050 ("cannot inject into ... getPlayers ...
-    merged by ... MixinThreadedAnvilChunkStorage with priority 1050"). A fix (that overwrite in its
-    own mixin at priority 900) was written and tested on 2026-10-26, then removed from this tree on
-    2026-10-27; do not re-add it. The Forge port keeps it for the original CBC: Modern Warfare and
-    SecurityCraft 1.20.1.
+    VMP's optimized getPlayers overwrite is isolated at priority 900, allowing CBC's camera
+    @ModifyExpressionValue at the getLastSectionPos() invocation to apply. The VMP config's base
+    priority remains 1050 for its other mixins. No server startup with CBC has been performed; see
+    CBC-NEO-WARFARE-COMPAT.md for scope, provenance and static checks.
 
 =============================================================
 ALREADY KNOWN — bundled into SuperChunk or handled elsewhere (skipped per request)

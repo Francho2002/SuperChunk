@@ -1,6 +1,5 @@
 package dev.superchunk.com.ishland.vmp.mixins.playerwatching;
 
-import com.google.common.collect.ImmutableList;
 import dev.superchunk.com.ishland.vmp.common.chunkwatching.AreaPlayerChunkWatchingManager;
 import dev.superchunk.com.ishland.vmp.common.playerwatching.TACSExtension;
 import net.minecraft.core.SectionPos;
@@ -12,14 +11,11 @@ import net.minecraft.world.level.ChunkPos;
 import org.slf4j.Logger;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Overwrite;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-import java.util.List;
 
 /**
  * VMP's area-based player-watching / chunk-sending rewrite, translated from Yarn
@@ -106,33 +102,8 @@ public abstract class MixinThreadedAnvilChunkStorage implements TACSExtension {
         areaPlayerChunkWatchingManager.setWatchDistance(this.serverViewDistance);
     }
 
-    /**
-     * @author ishland
-     * @reason use array for iteration & use squares as cylinders are expensive
-     */
-    @Overwrite
-    public List<ServerPlayer> getPlayers(ChunkPos chunkPos, boolean onlyOnWatchDistanceEdge) {
-        final AreaPlayerChunkWatchingManager watchingManager = this.areaPlayerChunkWatchingManager;
-
-        Object[] set = watchingManager.getPlayersWatchingChunkArray(chunkPos.toLong());
-        ImmutableList.Builder<ServerPlayer> builder = ImmutableList.builder();
-
-        for (Object __player : set) {
-            if (__player instanceof ServerPlayer serverPlayer) {
-                SectionPos watchedPos = serverPlayer.getLastSectionPos();
-                int chebyshevDistance = Math.max(Math.abs(watchedPos.x() - chunkPos.x), Math.abs(watchedPos.z() - chunkPos.z));
-                if (chebyshevDistance > this.serverViewDistance) {
-                    continue;
-                }
-                if (!serverPlayer.connection.chunkSender.isPending(chunkPos.toLong()) &&
-                    (!onlyOnWatchDistanceEdge || chebyshevDistance == this.serverViewDistance)) {
-                    builder.add(serverPlayer);
-                }
-            }
-        }
-
-        return builder.build();
-    }
+    // getPlayers is isolated in MixinChunkMapGetPlayers at priority 900 so higher-priority camera
+    // injectors can still apply to its optimized body.
 
     @Inject(method = "updatePlayerStatus", at = @At("HEAD"))
     private void onHandlePlayerAddedOrRemoved(ServerPlayer player, boolean added, CallbackInfo ci) {

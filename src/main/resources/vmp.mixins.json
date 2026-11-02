@@ -11,6 +11,7 @@
     "playerwatching.MixinChunkFilter",
     "playerwatching.MixinServerPlayerEntity",
     "playerwatching.MixinTACSCancelSending",
+    "playerwatching.MixinChunkMapGetPlayers",
     "playerwatching.MixinThreadedAnvilChunkStorage"
   ],
   "injectors": {
