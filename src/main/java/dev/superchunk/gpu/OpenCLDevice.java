@@ -29,6 +29,15 @@ public record OpenCLDevice(
         return amd && name != null && RX_9070_XT.matcher(name.trim()).matches();
     }
 
+    /** OpenCL extension names are space-separated tokens, not substrings. */
+    static boolean hasExtension(String extensions, String extension) {
+        if (extensions == null || extension == null || extension.isEmpty()) return false;
+        for (String token : extensions.trim().split("\\s+")) {
+            if (token.equals(extension)) return true;
+        }
+        return false;
+    }
+
     public String describe() {
         return String.format("%s [%s, vendorId=0x%04x] | driver=%s | %s | CU=%d | "
                         + "global=%d local=%d maxAlloc=%d maxGroup=%d maxItems=%s | "

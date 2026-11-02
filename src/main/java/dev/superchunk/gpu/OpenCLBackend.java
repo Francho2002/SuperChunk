@@ -374,14 +374,14 @@ public final class OpenCLBackend {
         int computeUnits = getDeviceInfoInt(device, CL_DEVICE_MAX_COMPUTE_UNITS);
         long globalMem = getDeviceInfoLong(device, CL_DEVICE_GLOBAL_MEM_SIZE);
         long fpConfig = getDeviceInfoLong(device, CL_DEVICE_DOUBLE_FP_CONFIG);
-        boolean fp64 = fpConfig != 0L || (extensions != null && extensions.contains("cl_khr_fp64"));
+        boolean fp64 = fpConfig != 0L || OpenCLDevice.hasExtension(extensions, "cl_khr_fp64");
         // CL_DEVICE_SINGLE_FP_CONFIG is a cl_device_fp_config (cl_bitfield = 64-bit), so the
         // 8-byte read is correct here (unlike the 4-byte cl_uint MAX_COMPUTE_UNITS above).
         // Bit (1<<7) = CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT (core OpenCL 1.2): the device can
         // honor the -cl-fp32-correctly-rounded-divide-sqrt build flag.
         long singleFpConfig = getDeviceInfoLong(device, CL_DEVICE_SINGLE_FP_CONFIG);
         boolean crDivideFp32 = (singleFpConfig & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT) != 0L;
-        boolean nvCompilerOptions = extensions != null && extensions.contains("cl_nv_compiler_options");
+        boolean nvCompilerOptions = OpenCLDevice.hasExtension(extensions, "cl_nv_compiler_options");
         return new OpenCLDevice(platform, device, platformIndex, deviceIndex, name, vendor, vendorId, driver, version, extensions,
                 computeUnits, globalMem, getDeviceInfoLong(device, CL_DEVICE_LOCAL_MEM_SIZE),
                 getDeviceInfoLong(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE),

@@ -23,6 +23,8 @@ public final class OpenCLDeviceRegressionTest {
         check(!device("gfx1201", "AMD", 0x1002, true).isRx9070Xt(), "ambiguous architecture");
         check(!device("AMD Radeon RX 9070 XT", "NVIDIA", 0x10de, true).isRx9070Xt(), "vendor");
         check(!device("AMD Radeon RX 9070 XT PRO", "AMD", 0x1002, true).isRx9070Xt(), "suffix");
+        check(OpenCLDevice.hasExtension("cl_other cl_khr_fp64 cl_more", "cl_khr_fp64"), "extension token");
+        check(!OpenCLDevice.hasExtension("cl_khr_fp64_extra", "cl_khr_fp64"), "extension substring");
         check(DeviceSelection.identity(List.of(other, rx), rx.vendor(), rx.name()) == rx, "identity");
         check(DeviceSelection.identity(List.of(rx, rx), rx.vendor(), rx.name()) == null, "duplicate identity");
         check(DeviceSelection.identity(List.of(rx), "", rx.name()) == null, "incomplete identity");
