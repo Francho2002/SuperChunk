@@ -154,9 +154,18 @@ public final class GpuConfig {
      * Never throws: on any error it logs and returns the defaults.
      */
     public static GpuConfig load() {
+        try {
+            return fromProperties(SuperChunkConfig.gpuProperties());
+        } catch (Throwable t) {
+            LOGGER.warn("[SuperChunk-GPU] Failed to load gpu.* config — using defaults (enabled=false)", t);
+            return new GpuConfig();
+        }
+    }
+
+    /** Explicit standalone configuration; properties are unprefixed, like gpuProperties(). */
+    static GpuConfig fromProperties(Properties props) {
         GpuConfig cfg = new GpuConfig();
         try {
-            Properties props = SuperChunkConfig.gpuProperties();
             cfg.enabled = parseBool(props.getProperty(K_ENABLED), cfg.enabled);
             cfg.platformIndex = parseInt(props.getProperty(K_PLATFORM), cfg.platformIndex);
             cfg.deviceIndex = parseInt(props.getProperty(K_DEVICE), cfg.deviceIndex);

@@ -372,6 +372,21 @@ sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.main.compileClasspath
 // These programs use explicit assertions and need no additional test framework.
 tasks.named('test') { failOnNoDiscoveredTests = false }
+
+// Explicit, standalone diagnostic; never runs as part of build/check or game startup.
+tasks.register('standaloneGpuProbe', JavaExec) {
+    group = 'verification'
+    description = 'Runs a bounded FP64 GPU batch diagnostic without launching Minecraft.'
+    dependsOn tasks.named('classes')
+    classpath = sourceSets.test.runtimeClasspath + configurations.lwjglServerBundle
+    mainClass = 'dev.superchunk.gpu.StandaloneBatchProbe'
+    systemProperty 'java.awt.headless', 'true'
+    timeout = java.time.Duration.ofSeconds(60)
+    args '--run'
+    def probeDir = layout.buildDirectory.dir('standalone-gpu-probe').get().asFile
+    workingDir = probeDir
+    doFirst { probeDir.mkdirs() }
+}
 [
     schedulerRegressionTest: 'dev.superchunk.com.ishland.flowsched.scheduler.SchedulerRegressionTest',
     smallPaletteRegressionTest: 'dev.superchunk.worldgen.SmallPaletteIndicesTest',

@@ -1,6 +1,7 @@
 package dev.superchunk.gpu;
 
 import java.util.List;
+import java.util.Properties;
 
 /** Pure fixtures: no driver, game or hardware required. */
 public final class OpenCLDeviceRegressionTest {
@@ -37,6 +38,16 @@ public final class OpenCLDeviceRegressionTest {
         check(DeviceSelection.preferredRx(List.of(rx, rx), true) == null, "ambiguous preference");
         check(DeviceSelection.preferredRx(List.of(device(rx.name(), rx.vendor(), 0x1002, false)), true) == null,
                 "precision requirement");
+        Properties disabled = new Properties();
+        OpenCLBackend.init(GpuConfig.fromProperties(disabled));
+        check(!OpenCLBackend.isAvailable(), "disabled explicit config cannot initialize a backend");
+        check(!OpenCLBackend.config().isEnabled(), "disabled config remains disabled");
+        try {
+            StandaloneBatchProbe.remaining(System.nanoTime() - 1);
+            throw new AssertionError("expired deadline accepted");
+        } catch (java.util.concurrent.TimeoutException expected) {
+            // An expired global budget must fail before another wait or submission.
+        }
         System.out.println("OpenCL device fixtures passed");
     }
 }

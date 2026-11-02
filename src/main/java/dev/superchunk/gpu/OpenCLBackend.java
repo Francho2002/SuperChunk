@@ -124,6 +124,11 @@ public final class OpenCLBackend {
      * chosen device. Never throws. Idempotent-ish: calling twice re-inits.
      */
     public static synchronized void init() {
+        init(null);
+    }
+
+    /** Standalone diagnostics can supply an isolated config without touching the game config. */
+    static synchronized void init(GpuConfig explicitConfig) {
         // A prior shutdown() leaves shuttingDown=true so any late resource-owner
         // registration self-closes; clear it now that we are (re)initializing and
         // will legitimately accept resource owners again.
@@ -133,7 +138,7 @@ public final class OpenCLBackend {
             return;
         }
         try {
-            config = GpuConfig.load();
+            config = explicitConfig != null ? explicitConfig : GpuConfig.load();
         } catch (Throwable t) {
             LOGGER.warn("[SuperChunk-GPU] config load failed; backend disabled", t);
             return;
