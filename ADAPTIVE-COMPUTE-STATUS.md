@@ -85,7 +85,8 @@ they do not call a real OpenCL driver. The configuration documentation round-tri
 fixtures passed again after the final configuration edit. No hardware benchmark ran. NeoForge
 21.1.265 is the intended runtime, not a version validated by this build.
 
-The CBC `MixinNoiseConfig` priority 900 patch is unchanged relative to the base. Existing
+The CBC `MixinChunkMapGetPlayers` priority 900 patch is unchanged relative to the base.
+`MixinNoiseConfig` also has priority 900 independently. Existing
 mixins and regression tests passed static/build checks; this is not an integrated game test.
 No independent C2ME OpenCL, extra LWJGL runtime or other mod was introduced. The known
 independent C2ME OpenCL/LWJGL module conflict remains a deployment constraint.
