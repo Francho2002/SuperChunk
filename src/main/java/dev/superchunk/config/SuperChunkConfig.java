@@ -110,6 +110,15 @@ public final class SuperChunkConfig {
                         + "-1 = choose automatically.");
         def("gpu.deviceIndex", "-1",
                 "GPU within that platform, by its number in the startup log. -1 = choose automatically.");
+        def("gpu.deviceVendor", "auto",
+                "Exact OpenCL vendor string, used with deviceName when indices are not both specified. "
+                        + "Both must match exactly one device; auto disables identity selection.");
+        def("gpu.deviceName", "auto",
+                "Exact OpenCL device name, used together with deviceVendor to select one unique device; "
+                        + "auto disables identity selection.");
+        def("gpu.preferRx9070Xt", "false",
+                "Prefer an unambiguously identified AMD Radeon RX 9070 XT during automatic selection. "
+                        + "This does not enable calibration or change existing processing parameters.");
         def("gpu.desiredFp", "fp64",
                 "Precision of the GPU terrain math. fp64 = double precision, terrain identical to vanilla; "
                         + "devices without fp64 are not used. auto = fp64 if the device supports it, otherwise "

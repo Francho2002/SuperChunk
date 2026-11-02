@@ -383,6 +383,7 @@ tasks.named('test') { failOnNoDiscoveredTests = false }
     flatClimateRegressionTest: 'dev.superchunk.worldgen.FlatClimateIndexTest',
     biomeFiddleCacheRegressionTest: 'dev.superchunk.worldgen.BiomeFiddleCacheTest',
     configDocsRegressionTest: 'dev.superchunk.config.SuperChunkConfigDocsTest',
+    openCLDeviceRegressionTest: 'dev.superchunk.gpu.OpenCLDeviceRegressionTest',
     mixinTargetScanRegressionTest: 'dev.superchunk.MixinTargetScanTest',
     skeinCompatRegressionTest: 'dev.superchunk.compat.SkeinCompatTest',
     mixinSquaredBridgeRegressionTest: 'dev.superchunk.compat.MixinSquaredBridgeTest',

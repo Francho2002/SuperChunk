@@ -60,6 +60,9 @@ public final class GpuConfig {
     private boolean enabled = false;
     private int platformIndex = -1;
     private int deviceIndex = -1;
+    private String deviceVendor = "";
+    private String deviceName = "";
+    private boolean preferRx9070Xt = false;
     private FpMode fpMode = FpMode.FP64;
     private boolean selftestNoise = false;
     private boolean selftestDfc = false;
@@ -157,6 +160,9 @@ public final class GpuConfig {
             cfg.enabled = parseBool(props.getProperty(K_ENABLED), cfg.enabled);
             cfg.platformIndex = parseInt(props.getProperty(K_PLATFORM), cfg.platformIndex);
             cfg.deviceIndex = parseInt(props.getProperty(K_DEVICE), cfg.deviceIndex);
+            cfg.deviceVendor = identityPart(props.getProperty("deviceVendor", "auto"));
+            cfg.deviceName = identityPart(props.getProperty("deviceName", "auto"));
+            cfg.preferRx9070Xt = parseBool(props.getProperty("preferRx9070Xt"), false);
             // Precision: the three-way desiredFp. The legacy boolean requireFp64 is TRANSLATED
             // into desiredFp at config migration (SuperChunkConfig.migrateLegacy), and desiredFp
             // is always seeded from the unified-config defaults, so there is no live requireFp64
@@ -187,6 +193,11 @@ public final class GpuConfig {
             LOGGER.warn("[SuperChunk-GPU] Failed to load gpu.* config — using defaults (enabled=false)", t);
         }
         return cfg;
+    }
+
+    private static String identityPart(String s) {
+        s = s.trim();
+        return s.equalsIgnoreCase("auto") ? "" : s;
     }
 
     private static boolean parseBool(String s, boolean def) {
@@ -226,6 +237,10 @@ public final class GpuConfig {
     public int deviceIndex() {
         return deviceIndex;
     }
+
+    public String deviceVendor() { return deviceVendor; }
+    public String deviceName() { return deviceName; }
+    public boolean preferRx9070Xt() { return preferRx9070Xt; }
 
     /** The desired floating-point precision mode (auto / fp64 / fp32). Never null. */
     public FpMode fpMode() {

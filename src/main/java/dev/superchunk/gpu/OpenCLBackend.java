@@ -321,10 +321,10 @@ public final class OpenCLBackend {
                     LOGGER.info("[SuperChunk-GPU]   (no devices on this platform)");
                     continue;
                 }
-                for (long deviceId : deviceIds) {
-                    OpenCLDevice dev = readDevice(platform, deviceId);
+                for (int d = 0; d < deviceIds.length; d++) {
+                    OpenCLDevice dev = readDevice(platform, deviceIds[d], p, d);
                     result.add(dev);
-                    LOGGER.info("[SuperChunk-GPU]   Device: {}", dev.describe());
+                    LOGGER.info("[SuperChunk-GPU]   Device[{}]: {}", d, dev.describe());
                 }
             }
         }
@@ -364,9 +364,11 @@ public final class OpenCLBackend {
         }
     }
 
-    private static OpenCLDevice readDevice(long platform, long device) {
+    private static OpenCLDevice readDevice(long platform, long device, int platformIndex, int deviceIndex) {
         String name = getDeviceInfoString(device, CL_DEVICE_NAME);
         String vendor = getDeviceInfoString(device, CL_DEVICE_VENDOR);
+        int vendorId = getDeviceInfoInt(device, CL_DEVICE_VENDOR_ID);
+        String driver = getDeviceInfoString(device, CL_DRIVER_VERSION);
         String version = getDeviceInfoString(device, CL_DEVICE_VERSION);
         String extensions = getDeviceInfoString(device, CL_DEVICE_EXTENSIONS);
         int computeUnits = getDeviceInfoInt(device, CL_DEVICE_MAX_COMPUTE_UNITS);
@@ -380,8 +382,11 @@ public final class OpenCLBackend {
         long singleFpConfig = getDeviceInfoLong(device, CL_DEVICE_SINGLE_FP_CONFIG);
         boolean crDivideFp32 = (singleFpConfig & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT) != 0L;
         boolean nvCompilerOptions = extensions != null && extensions.contains("cl_nv_compiler_options");
-        return new OpenCLDevice(platform, device, name, vendor, version, computeUnits, globalMem, fp64, crDivideFp32,
-                nvCompilerOptions);
+        return new OpenCLDevice(platform, device, platformIndex, deviceIndex, name, vendor, vendorId, driver, version, extensions,
+                computeUnits, globalMem, getDeviceInfoLong(device, CL_DEVICE_LOCAL_MEM_SIZE),
+                getDeviceInfoLong(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE),
+                getDeviceInfoSize(device, CL_DEVICE_MAX_WORK_GROUP_SIZE), getWorkItemSizes(device),
+                singleFpConfig, fpConfig, fp64, crDivideFp32, nvCompilerOptions);
     }
 
     /** Picks a device per config: explicit indices, else fp64-preferred GPU, else first. */
@@ -390,28 +395,23 @@ public final class OpenCLBackend {
         int dIdx = config.deviceIndex();
 
         if (pIdx >= 0 && dIdx >= 0) {
-            // Resolve platform-relative device index against the flat enumerated list.
-            List<OpenCLDevice> onPlatform = new ArrayList<>();
-            // Collect distinct platforms in enumeration order.
-            List<Long> platformOrder = new ArrayList<>();
-            for (OpenCLDevice d : devices) {
-                if (!platformOrder.contains(d.platform())) {
-                    platformOrder.add(d.platform());
-                }
-            }
-            if (pIdx < platformOrder.size()) {
-                long platform = platformOrder.get(pIdx);
-                for (OpenCLDevice d : devices) {
-                    if (d.platform() == platform) {
-                        onPlatform.add(d);
-                    }
-                }
-                if (dIdx < onPlatform.size()) {
-                    return onPlatform.get(dIdx);
-                }
-            }
+            OpenCLDevice match = DeviceSelection.indices(devices, pIdx, dIdx);
+            if (match != null) return match;
             LOGGER.warn("[SuperChunk-GPU] config platformIndex={}/deviceIndex={} out of range — auto-picking.",
                     pIdx, dIdx);
+        }
+
+        String wantedVendor = config.deviceVendor();
+        String wantedName = config.deviceName();
+        if (!wantedVendor.isEmpty() || !wantedName.isEmpty()) {
+            OpenCLDevice match = DeviceSelection.identity(devices, wantedVendor, wantedName);
+            if (match != null) return match;
+            LOGGER.warn("[SuperChunk-GPU] Device identity missing, ambiguous or not found; auto-picking.");
+        }
+        if (config.preferRx9070Xt()) {
+            OpenCLDevice match = DeviceSelection.preferredRx(devices, config.fpMode() == FpMode.FP64);
+            if (match != null) return match;
+            LOGGER.info("[SuperChunk-GPU] RX 9070 XT absent, ambiguous or incompatible; auto-picking.");
         }
 
         // Auto: prefer an fp64-capable device unless precision is force-fp32.
@@ -521,6 +521,30 @@ public final class OpenCLBackend {
             return val.get(0);
         } catch (Throwable t) {
             return 0L;
+        }
+    }
+
+    /** size_t is pointer-sized, unlike cl_ulong on 32-bit hosts. */
+    private static long getDeviceInfoSize(long device, int param) {
+        try (MemoryStack stack = stackPush()) {
+            PointerBuffer value = stack.mallocPointer(1);
+            return clGetDeviceInfo(device, param, value, null) == CL_SUCCESS ? value.get(0) : 0L;
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    private static List<Long> getWorkItemSizes(long device) {
+        int dimensions = getDeviceInfoInt(device, CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS);
+        if (dimensions <= 0 || dimensions > 64) return List.of();
+        try (MemoryStack stack = stackPush()) {
+            PointerBuffer values = stack.mallocPointer(dimensions);
+            if (clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_ITEM_SIZES, values, null) != CL_SUCCESS) return List.of();
+            List<Long> sizes = new ArrayList<>(dimensions);
+            for (int i = 0; i < dimensions; i++) sizes.add(values.get(i));
+            return List.copyOf(sizes);
+        } catch (Throwable t) {
+            return List.of();
         }
     }
 

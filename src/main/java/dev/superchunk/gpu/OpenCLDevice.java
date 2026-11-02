@@ -1,47 +1,41 @@
 package dev.superchunk.gpu;
 
-/**
- * An enumerated OpenCL device plus the capabilities SuperChunk cares about.
- *
- * @param platform        native {@code cl_platform_id} pointer
- * @param device          native {@code cl_device_id} pointer
- * @param name            {@code CL_DEVICE_NAME}
- * @param vendor          {@code CL_DEVICE_VENDOR}
- * @param openclVersion   {@code CL_DEVICE_VERSION} (e.g. "OpenCL 3.0 NEO")
- * @param maxComputeUnits {@code CL_DEVICE_MAX_COMPUTE_UNITS}
- * @param globalMemBytes  {@code CL_DEVICE_GLOBAL_MEM_SIZE}
- * @param fp64            whether the device supports 64-bit doubles
- *                        (CL_DEVICE_DOUBLE_FP_CONFIG != 0 OR the
- *                        {@code cl_khr_fp64} extension is present)
- * @param crDivideFp32    whether {@code CL_DEVICE_SINGLE_FP_CONFIG} advertises
- *                        {@code CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT} (core OpenCL 1.2,
- *                        bit {@code 1<<7}) — i.e. the device supports the
- *                        {@code -cl-fp32-correctly-rounded-divide-sqrt} build flag that
- *                        forces IEEE-correctly-rounded fp32 divide/sqrt (spline-drift lever)
- * @param nvCompilerOptions whether the device advertises NVIDIA's {@code cl_nv_compiler_options}
- *                        extension, which defines the {@code -cl-nv-*} build options (among them
- *                        {@code -cl-nv-opt-level}, the ptxas optimization level)
- */
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
+
+/** Snapshot of the capabilities reported by an OpenCL device, not inferred hardware specs. */
 public record OpenCLDevice(
-        long platform,
-        long device,
-        String name,
-        String vendor,
-        String openclVersion,
-        int maxComputeUnits,
-        long globalMemBytes,
-        boolean fp64,
-        boolean crDivideFp32,
-        boolean nvCompilerOptions
-) {
-    /** Human-readable one-line caps summary for logging. */
+        long platform, long device, int platformIndex, int deviceIndex, String name, String vendor, int vendorId,
+        String driverVersion, String openclVersion, String extensions,
+        int maxComputeUnits, long globalMemBytes, long localMemBytes,
+        long maxMemAllocBytes, long maxWorkGroupSize, List<Long> maxWorkItemSizes,
+        long singleFpConfig, long doubleFpConfig, boolean fp64,
+        boolean crDivideFp32, boolean nvCompilerOptions) {
+
+    private static final Pattern RX_9070_XT = Pattern.compile(
+            "^(?:amd\\s+)?radeon(?:\\(tm\\))?\\s+rx\\s+9070\\s+xt(?:\\s+graphics)?$",
+            Pattern.CASE_INSENSITIVE);
+
+    public OpenCLDevice {
+        maxWorkItemSizes = List.copyOf(maxWorkItemSizes);
+    }
+
+    /** Conservative model identification; generic architecture names are insufficient. */
+    public boolean isRx9070Xt() {
+        boolean amd = vendorId == 0x1002 && vendor != null
+                && (vendor.toLowerCase(Locale.ROOT).contains("advanced micro devices")
+                    || vendor.trim().equalsIgnoreCase("AMD"));
+        return amd && name != null && RX_9070_XT.matcher(name.trim()).matches();
+    }
+
     public String describe() {
-        return String.format(
-                "%s [%s] | %s | CU=%d | mem=%.1f GiB | fp64=%s | crDivideFp32=%s | nvCompilerOptions=%s",
-                name, vendor, openclVersion, maxComputeUnits,
-                globalMemBytes / (1024.0 * 1024.0 * 1024.0),
-                fp64 ? "yes" : "no",
-                crDivideFp32 ? "yes" : "no",
-                nvCompilerOptions ? "yes" : "no");
+        return String.format("%s [%s, vendorId=0x%04x] | driver=%s | %s | CU=%d | "
+                        + "global=%d local=%d maxAlloc=%d maxGroup=%d maxItems=%s | "
+                        + "fp32=0x%x fp64=0x%x (%s) | profile=%s | extensions=%s",
+                name, vendor, vendorId, driverVersion, openclVersion, maxComputeUnits,
+                globalMemBytes, localMemBytes, maxMemAllocBytes, maxWorkGroupSize,
+                maxWorkItemSizes, singleFpConfig, doubleFpConfig, fp64,
+                isRx9070Xt() ? "RX 9070 XT (uncalibrated)" : "generic", extensions);
     }
 }
