@@ -29,10 +29,16 @@ public abstract class MixinProjectExplosiveTerrainSweep {
     @WrapMethod(method = "l11oo1ilili0l0lloii0oili(Lnet/minecraft/server/level/ServerLevel;)V", require = 0)
     private void superchunk$terrainSweepScope(ServerLevel level, Operation<Void> original) throws Throwable {
         BlockPos origin = this.loll01loloioooo00l00lo11;
+        double originalOuterRadius = Double.NaN;
+        double effectiveOuterRadius = Double.NaN;
+        if ((Object) this instanceof ProjectExplosiveTerrainScaleState scaleState) {
+            originalOuterRadius = scaleState.superchunk$originalTerrainTarget();
+            effectiveOuterRadius = scaleState.superchunk$effectiveTerrainTarget();
+        }
         Scope scope = ProjectExplosivePerfDiagnostics.beginTerrainSweep(
                 origin == null ? Integer.MIN_VALUE : origin.getX() >> 4,
                 origin == null ? Integer.MIN_VALUE : origin.getZ() >> 4,
-                this.ll0llol1li01lolio10011l0);
+                this.ll0llol1li01lolio10011l0, originalOuterRadius, effectiveOuterRadius);
         Throwable failure = null;
         try {
             original.call(level);

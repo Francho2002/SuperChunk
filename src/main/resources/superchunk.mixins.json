@@ -82,6 +82,7 @@
     "MixinWorldGenRegionInlineHeights",
     "MixinServerLevelGpuScopeRetirement",
     "MixinProjectExplosiveTerrainSweep",
+    "MixinProjectExplosiveNuclearTerrainScale",
     "MixinProjectExplosiveTerrainChunkCache",
     "MixinProjectExplosiveRadialDestruction",
     "MixinProjectExplosiveRadialChunkCache"

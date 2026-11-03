@@ -10,6 +10,8 @@ The hooks are disabled by default. Enable them at JVM startup with:
 -Dsuperchunk.diagnostics.projectExplosive=true
 ```
 
+The separately gated nuclear terrain scale is documented in [PROJECT-EXPLOSIVE-NUCLEAR-TERRAIN-SCALE.md](PROJECT-EXPLOSIVE-NUCLEAR-TERRAIN-SCALE.md). Its Mixin remains disabled unless its own enable property is set.
+
 When enabled, summaries are emitted only for scopes lasting at least 100 ms by default, with a maximum of 6 summaries per minute. These can be adjusted with `-Dsuperchunk.diagnostics.projectExplosive.minDurationMs=N` and `-Dsuperchunk.diagnostics.projectExplosive.maxLogsPerMinute=N` (the latter is capped at 60). A short operation therefore produces no summary unless the threshold is lowered.
 
 The mixin plugin checks the raw resource SHA-256 for each target class before applying its optional Mixin. The expected hashes are:
@@ -48,11 +50,11 @@ Each emitted record begins with `[FASTCHUNK-PE-PERF]` and includes `scope`, `id`
 
 `RADIAL_DESTRUCTION` reports its own duration, `syncGetChunkCalls`, `syncGetChunkReturned`, `syncGetChunkFailures`, their total and maximum latency and chunk, direct mutation count/results/timing, radius and target chunk, and `budgetMs=n/a`.
 
-When a timing source is unavailable or no timed call occurred, the field is `n/a`, not `0`. CPU timing is read only when `ThreadMXBean` already supports and has enabled current-thread CPU time; this code never enables global JVM profiling. Invalid/negative elapsed values are excluded from sums and counted in `invalidDurations`.
+When a timing source is unavailable or no timed call occurred, the field is `n/a`, not `0`. CPU timing is read only when `ThreadMXBean` already supports and has enabled current-thread CPU time; this code never enables global JVM profiling. Invalid/negative elapsed values are excluded from sums and counted in `invalidDurations`. When the optional terrain scale is active and a terrain summary is emitted, `outerSweepOriginalRadiusBlocks`, `outerSweepEffectiveRadiusBlocks`, and `outerSweepCandidateColumnsAvoidedEstimate` report the raw and stored targets plus the geometric estimate of integer X/Z candidate columns outside the effective open disk. The estimate is not a count of changed blocks or a measured TPS improvement.
 
 `unattributedMs` is total scope wall time minus the directly timed chunk lookup, direct block mutation and nested-scope durations, clamped to zero to avoid negative rounding. Per-iteration time overlaps those leaf timers and is intentionally not subtracted a second time. The residual can include ordinary terrain calculations, unwrapped helper work, scheduler delays, GC pauses, or other activity; it does not identify a cause. High wall time with much lower CPU time is compatible with waiting, descheduling, or a JVM pause, but is not proof of which occurred.
 
-The mutation counters cover the verified direct call sites in the PE classes named above, not every downstream world callback or mutation in Minecraft or other mods. They do not cause additional chunk reads, loads, tickets, per-block logs, or growing collections. While diagnostics are enabled, timed wrappers add `nanoTime()` around each instrumented operation; with the property off the mixins are not applied.
+The mutation counters cover the verified direct call sites in the PE classes named above, not every downstream world callback or mutation in Minecraft or other mods. They do not cause additional chunk reads, loads, tickets, per-block logs, or growing collections. While diagnostics are enabled, timed wrappers add `nanoTime()` around each instrumented operation; with the diagnostics property off those diagnostic mixins are not applied. The terrain scale is independently gated and OFF by default.
 
 ## Offline verification
 

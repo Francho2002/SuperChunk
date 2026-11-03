@@ -19,6 +19,7 @@ public final class ProjectExplosivePerfDiagnosticsRegressionTest {
         disabledTrackerHasNoScopeOrRecords();
         operationCountersAndMaximaAreExact();
         nestedScopesStaySeparateAndRestore();
+        terrainScaleMetricsReportExactSkippedRingCandidates();
         exceptionClosesAndRestoresScope();
         overflowIsBoundedAndSuppressesAttribution();
         rateLimitAndThresholdAreEnforced();
@@ -103,6 +104,17 @@ public final class ProjectExplosivePerfDiagnosticsRegressionTest {
         check(!fixture.tracker.isActive(ScopeKind.TERRAIN_SWEEP), "exceptional completion restores ThreadLocal state");
         contains(onlyLine(fixture.lines), "outcome=exception:RuntimeException", "exception result is recorded");
         contains(onlyLine(fixture.lines), "scopeRestored=true", "restoration status is reported");
+    }
+
+    private static void terrainScaleMetricsReportExactSkippedRingCandidates() {
+        Fixture fixture = new Fixture(true, 0L);
+        Scope scope = fixture.tracker.begin(ScopeKind.TERRAIN_SWEEP, 0, 0, 300.0, 18.0, 600.0, 300.0);
+        fixture.wall.addAndGet(1_100_000_000L);
+        scope.finish(null);
+        String line = onlyLine(fixture.lines);
+        contains(line, "outerSweepOriginalRadiusBlocks=600.000", "original destructive sweep target");
+        contains(line, "outerSweepEffectiveRadiusBlocks=300.000", "effective destructive sweep target");
+        contains(line, "outerSweepCandidateColumnsAvoidedEstimate=848216", "estimated omitted lattice candidates in the audited radial iterator");
     }
 
     private static void overflowIsBoundedAndSuppressesAttribution() {

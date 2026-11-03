@@ -77,6 +77,11 @@ public final class SuperChunkMixinPlugin implements IMixinConfigPlugin {
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
         // Project: Explosive is optional. These hooks are not loaded by default, and even when
         // enabled they require the exact audited target class bytes from PE 0.7.2-beta.
+        if (mixinClassName.equals("dev.superchunk.mixin.MixinProjectExplosiveNuclearTerrainScale")) {
+            return dev.superchunk.diag.projectexplosive.ProjectExplosiveNuclearTerrainScale.enabled()
+                    && dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics
+                    .targetBytecodeMatches(targetClassName);
+        }
         if (mixinClassName.startsWith("dev.superchunk.mixin.MixinProjectExplosive")) {
             return Boolean.parseBoolean(System.getProperty(
                             dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.PROPERTY, "false"))

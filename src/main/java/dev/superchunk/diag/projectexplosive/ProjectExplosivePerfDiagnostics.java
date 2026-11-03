@@ -54,7 +54,12 @@ public final class ProjectExplosivePerfDiagnostics {
 
     /** True only when this exact target class has the bytecode audited for this integration. */
     public static boolean targetMatches(String dottedClassName) {
-        if (!ENABLED || dottedClassName == null) return false;
+        return ENABLED && targetBytecodeMatches(dottedClassName);
+    }
+
+    /** Verifies the pinned optional target class independently of whether performance logs are enabled. */
+    public static boolean targetBytecodeMatches(String dottedClassName) {
+        if (dottedClassName == null) return false;
         try {
             String expected = expectedClassHash(dottedClassName);
             return expected != null && expected.equals(classResourceHash(dottedClassName));
@@ -106,8 +111,14 @@ public final class ProjectExplosivePerfDiagnostics {
     }
 
     public static Scope beginTerrainSweep(int targetChunkX, int targetChunkZ, double targetRadiusBlocks) {
+        return beginTerrainSweep(targetChunkX, targetChunkZ, targetRadiusBlocks, Double.NaN, Double.NaN);
+    }
+
+    public static Scope beginTerrainSweep(int targetChunkX, int targetChunkZ, double targetRadiusBlocks,
+                                          double originalOuterRadiusBlocks, double effectiveOuterRadiusBlocks) {
         try {
-            return PRODUCTION.begin(ScopeKind.TERRAIN_SWEEP, targetChunkX, targetChunkZ, targetRadiusBlocks, 18.0);
+            return PRODUCTION.begin(ScopeKind.TERRAIN_SWEEP, targetChunkX, targetChunkZ, targetRadiusBlocks, 18.0,
+                    originalOuterRadiusBlocks, effectiveOuterRadiusBlocks);
         } catch (Throwable ignored) {
             return Scope.NOOP;
         }
@@ -261,6 +272,11 @@ public final class ProjectExplosivePerfDiagnostics {
         }
 
         Scope begin(ScopeKind kind, int chunkX, int chunkZ, double radiusBlocks, double budgetMs) {
+            return begin(kind, chunkX, chunkZ, radiusBlocks, budgetMs, Double.NaN, Double.NaN);
+        }
+
+        Scope begin(ScopeKind kind, int chunkX, int chunkZ, double radiusBlocks, double budgetMs,
+                    double originalOuterRadiusBlocks, double effectiveOuterRadiusBlocks) {
             if (!enabled) return Scope.NOOP;
             Context context = contexts.get();
             if (context == null) {
@@ -275,7 +291,8 @@ public final class ProjectExplosivePerfDiagnostics {
             long startWall = wallClock.getAsLong();
             long startCpu = safeCpuTime();
             Scope scope = new Scope(this, kind, idSupplier.getAsLong(), parent == null ? -1L : parent.id,
-                    startWall, startCpu, chunkX, chunkZ, radiusBlocks, budgetMs, parent);
+                    startWall, startCpu, chunkX, chunkZ, radiusBlocks, budgetMs,
+                    originalOuterRadiusBlocks, effectiveOuterRadiusBlocks, parent);
             context.top = scope;
             context.depth++;
             return scope;
@@ -410,6 +427,8 @@ public final class ProjectExplosivePerfDiagnostics {
         private final int targetChunkZ;
         private final double radiusBlocks;
         private final double budgetMs;
+        private final double originalOuterRadiusBlocks;
+        private final double effectiveOuterRadiusBlocks;
         private Scope previous;
         private boolean closed;
         private long iterations;
@@ -459,6 +478,8 @@ public final class ProjectExplosivePerfDiagnostics {
             this.targetChunkZ = Integer.MIN_VALUE;
             this.radiusBlocks = Double.NaN;
             this.budgetMs = Double.NaN;
+            this.originalOuterRadiusBlocks = Double.NaN;
+            this.effectiveOuterRadiusBlocks = Double.NaN;
             this.closed = true;
         }
 
@@ -474,10 +495,13 @@ public final class ProjectExplosivePerfDiagnostics {
             this.targetChunkZ = Integer.MIN_VALUE;
             this.radiusBlocks = Double.NaN;
             this.budgetMs = Double.NaN;
+            this.originalOuterRadiusBlocks = Double.NaN;
+            this.effectiveOuterRadiusBlocks = Double.NaN;
         }
 
         private Scope(Tracker owner, ScopeKind kind, long id, long parentId, long startWallNanos, long startCpuNanos,
-                      int targetChunkX, int targetChunkZ, double radiusBlocks, double budgetMs, Scope previous) {
+                      int targetChunkX, int targetChunkZ, double radiusBlocks, double budgetMs,
+                      double originalOuterRadiusBlocks, double effectiveOuterRadiusBlocks, Scope previous) {
             this.owner = owner;
             this.overflow = false;
             this.kind = kind;
@@ -489,6 +513,8 @@ public final class ProjectExplosivePerfDiagnostics {
             this.targetChunkZ = targetChunkZ;
             this.radiusBlocks = radiusBlocks;
             this.budgetMs = budgetMs;
+            this.originalOuterRadiusBlocks = originalOuterRadiusBlocks;
+            this.effectiveOuterRadiusBlocks = effectiveOuterRadiusBlocks;
             this.previous = previous;
         }
 
@@ -603,6 +629,9 @@ public final class ProjectExplosivePerfDiagnostics {
                         + " setBlockMaxMs=" + (timedSetBlockCalls == 0 ? "n/a" : ms(setBlockMaxNanos)) + " setBlockMaxChunk="
                         + coordinate(setBlockMaxX, setBlockMaxZ) + " syncGetChunkCalls=n/a"
                         + " radiusBlocks=" + numeric(radiusBlocks) + " radiusChunks=" + radiusChunks(radiusBlocks)
+                        + " outerSweepOriginalRadiusBlocks=" + numeric(originalOuterRadiusBlocks)
+                        + " outerSweepEffectiveRadiusBlocks=" + numeric(effectiveOuterRadiusBlocks)
+                        + " outerSweepCandidateColumnsAvoidedEstimate=" + candidateColumnsAvoided()
                         + " targetChunk=" + coordinate(targetChunkX, targetChunkZ) + " budgetMs=" + numeric(budgetMs)
                         + " nestedMs=" + ms(nestedElapsedNanos) + " unattributedMs=" + ms(unattributed)
                         + " invalidDurations=" + invalidDurations;
@@ -652,6 +681,32 @@ public final class ProjectExplosivePerfDiagnostics {
         private static String radiusChunks(double radiusBlocks) {
             if (!Double.isFinite(radiusBlocks) || radiusBlocks < 0 || radiusBlocks / 16.0 > Integer.MAX_VALUE) return "n/a";
             return Integer.toString((int) Math.ceil(radiusBlocks / 16.0));
+        }
+
+        private String candidateColumnsAvoided() {
+            if (!Double.isFinite(originalOuterRadiusBlocks) || !Double.isFinite(effectiveOuterRadiusBlocks)
+                    || originalOuterRadiusBlocks < effectiveOuterRadiusBlocks || effectiveOuterRadiusBlocks < 0.0) {
+                return "n/a";
+            }
+            long original = openCircleColumnCount(originalOuterRadiusBlocks);
+            long effective = openCircleColumnCount(effectiveOuterRadiusBlocks);
+            return original < 0 || effective < 0 ? "n/a" : Long.toString(original - effective);
+        }
+
+        /** Exact integer X/Z candidates omitted by the audited open-annulus iterator, bounded by its 600-block cap. */
+        private static long openCircleColumnCount(double radiusBlocks) {
+            if (!Double.isFinite(radiusBlocks) || radiusBlocks < 0.0 || radiusBlocks > 600.0) return -1L;
+            double radiusSquared = radiusBlocks * radiusBlocks;
+            int limit = (int) Math.ceil(radiusBlocks);
+            long count = 0L;
+            for (int z = -limit; z <= limit; z++) {
+                double zSquared = (double) z * z;
+                if (zSquared >= radiusSquared) continue;
+                int maxX = (int) Math.floor(Math.sqrt(radiusSquared - zSquared));
+                if (zSquared + (double) maxX * maxX >= radiusSquared) maxX--;
+                if (maxX >= 0) count += 2L * maxX + 1L;
+            }
+            return count;
         }
 
         private static String numeric(double number) {

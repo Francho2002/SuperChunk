@@ -443,6 +443,18 @@ tasks.register('projectExplosivePerfDiagnosticsRegressionTest', JavaExec) {
 }
 tasks.named('check') { dependsOn tasks.named('projectExplosivePerfDiagnosticsRegressionTest') }
 
+tasks.register('projectExplosiveNuclearTerrainScaleRegressionTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs JVM-only checks for the opt-in Project: Explosive nuclear terrain sweep scale.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.superchunk.diag.projectexplosive.ProjectExplosiveNuclearTerrainScaleRegressionTest'
+    def runDir = layout.buildDirectory.dir('regression-tests').get().asFile
+    workingDir = runDir
+    doFirst { runDir.mkdirs() }
+}
+tasks.named('check') { dependsOn tasks.named('projectExplosiveNuclearTerrainScaleRegressionTest') }
+
 tasks.register('projectExplosiveMixinContractVerification', JavaExec) {
     group = 'verification'
     description = 'Verifies PE 0.7.2-beta bytecode and FastChunk Mixin contracts against -PprojectExplosiveJar=<path>.'
