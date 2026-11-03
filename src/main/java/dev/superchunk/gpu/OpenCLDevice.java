@@ -11,7 +11,8 @@ public record OpenCLDevice(
         int maxComputeUnits, long globalMemBytes, long localMemBytes,
         long maxMemAllocBytes, long maxWorkGroupSize, List<Long> maxWorkItemSizes,
         long singleFpConfig, long doubleFpConfig, boolean fp64,
-        boolean crDivideFp32, boolean nvCompilerOptions) {
+        boolean crDivideFp32, boolean nvCompilerOptions,
+        String platformName, String platformVendor) {
 
     private static final Pattern RX_9070_XT = Pattern.compile(
             "^(?:amd\\s+)?radeon(?:\\(tm\\))?\\s+rx\\s+9070\\s+xt(?:\\s+graphics)?$",
@@ -19,6 +20,32 @@ public record OpenCLDevice(
 
     public OpenCLDevice {
         maxWorkItemSizes = List.copyOf(maxWorkItemSizes);
+        platformName = platformName == null ? "?" : platformName.trim();
+        platformVendor = platformVendor == null ? "?" : platformVendor.trim();
+    }
+
+    /** Source-compatible fixture constructor for callers without platform metadata. */
+    public OpenCLDevice(long platform, long device, int platformIndex, int deviceIndex,
+                        String name, String vendor, int vendorId, String driverVersion,
+                        String openclVersion, String extensions, int maxComputeUnits,
+                        long globalMemBytes, long localMemBytes, long maxMemAllocBytes,
+                        long maxWorkGroupSize, List<Long> maxWorkItemSizes,
+                        long singleFpConfig, long doubleFpConfig, boolean fp64,
+                        boolean crDivideFp32, boolean nvCompilerOptions) {
+        this(platform, device, platformIndex, deviceIndex, name, vendor, vendorId,
+                driverVersion, openclVersion, extensions, maxComputeUnits, globalMemBytes,
+                localMemBytes, maxMemAllocBytes, maxWorkGroupSize, maxWorkItemSizes,
+                singleFpConfig, doubleFpConfig, fp64, crDivideFp32, nvCompilerOptions, "?", "?");
+    }
+
+    /** True only when both stable platform identity strings were actually queried. */
+    public boolean hasStablePlatformIdentity() {
+        return stableIdentity(platformName) && stableIdentity(platformVendor);
+    }
+
+    private static boolean stableIdentity(String value) {
+        return value != null && !value.isBlank() && !value.equals("?")
+                && !value.equalsIgnoreCase("unknown");
     }
 
     /** Conservative model identification; generic architecture names are insufficient. */
@@ -41,10 +68,11 @@ public record OpenCLDevice(
     public String describe() {
         return String.format("%s [%s, vendorId=0x%04x] | driver=%s | %s | CU=%d | "
                         + "global=%d local=%d maxAlloc=%d maxGroup=%d maxItems=%s | "
-                        + "fp32=0x%x fp64=0x%x (%s) | profile=%s | extensions=%s",
+                        + "fp32=0x%x fp64=0x%x (%s) | platform=%s [%s] | profile=%s | extensions=%s",
                 name, vendor, vendorId, driverVersion, openclVersion, maxComputeUnits,
                 globalMemBytes, localMemBytes, maxMemAllocBytes, maxWorkGroupSize,
                 maxWorkItemSizes, singleFpConfig, doubleFpConfig, fp64,
+                platformName, platformVendor,
                 isRx9070Xt() ? "RX 9070 XT (uncalibrated)" : "generic", extensions);
     }
 }

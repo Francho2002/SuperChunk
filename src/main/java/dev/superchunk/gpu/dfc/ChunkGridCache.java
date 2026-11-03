@@ -10,7 +10,9 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SuperChunk GPU — Stage 5: <b>dispatch coalescing</b> for the GPU density-fill.
@@ -85,16 +87,6 @@ public final class ChunkGridCache {
     private static volatile boolean asyncEnabled = false;
 
     /**
-     * The most-roots fused group (realistically the main dimension's interpolated-grids
-     * group). The cross-chunk BATCHER is built over this group ({@link #ensureBatcher})
-     * and {@link #consumeBatchedGrid} serves only its deposits. NOTE (2026-07-02): the
-     * EAGER async dispatch at {@link #beginChunk} no longer uses this global — it
-     * resolves the chunk's OWN group from its lattice geometry ({@link #fusedForGeometry}),
-     * so non-primary dimensions stop paying wasted wrong-group dispatches.
-     */
-    private static volatile GpuFusedInterpolator primaryFused = null;
-
-    /**
      * Master enable for LIVE CROSS-CHUNK batching ({@code batchChunks}): wire the
      * {@link GpuChunkBatcher} into the noise status boundary so concurrently-generating
      * chunks' fused-group grids are computed in BATCHED dispatches with the worker freed
@@ -117,15 +109,25 @@ public final class ChunkGridCache {
     private static final Object BATCHER_LOCK = new Object();
 
     /**
-     * The live cross-chunk batcher (built lazily over {@link #primaryFused} once a
-     * fused group is discovered AND {@code batchChunks} is on), or null. The noise
-     * prefetch ({@link GpuBatchPrefetch}) submits to this; the consumer
+     * The live cross-chunk batcher (built lazily over the first eligible world's fused
+     * group when {@code batchChunks} is on), or null. Its world token never changes while
+     * requests may be in flight. The noise prefetch ({@link GpuBatchPrefetch}) submits to this; the consumer
      * ({@link #beginChunk}) serves the precomputed grids it deposited.
      */
     private static volatile GpuChunkBatcher liveBatcher = null;
 
     /** The exact fused group the {@link #liveBatcher} was compiled for (member k &harr; batch root k). */
     private static volatile GpuFusedInterpolator batcherFused = null;
+    /** The world/dimension scope whose ASTs were compiled into this single live batcher. */
+    private static volatile GpuWorldgenPolicy.WorldScope batcherScope = null;
+    /** One world may be waiting for the prior global batcher's safe retirement. */
+    private static volatile PendingBatcherRegistration pendingBatcherRegistration;
+    /** Best strictly larger same-scope group staged while the current owner is still active. */
+    private static volatile PendingBatcherRegistration pendingSameScopeReplacement;
+    private static final AtomicReference<GpuChunkBatcher> RETIRING_BATCHER = new AtomicReference<>();
+    private static volatile BatcherRetirement batcherRetirement;
+    /** Changes on every published owner so a delayed callback cannot clear a successor. */
+    private static long batcherGeneration;
 
     /** Bound the per-thread map; one entry per interpolated DF (~11), small. */
     private static final int MAX_ENTRIES = 64;
@@ -140,12 +142,50 @@ public final class ChunkGridCache {
     private static final Map<GpuDensityFunction, FusedMembership> FUSED_REGISTRY =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Serializes fused membership changes with scope retirement and native program close. */
+    private static final Object FUSED_LIFECYCLE_LOCK = new Object();
+
+    /** Fused program identity -> every scope that has registered the program. */
+    private static final Map<GpuFusedInterpolator, java.util.Set<GpuWorldgenPolicy.WorldScope>> FUSED_SCOPE_OWNERS =
+            new IdentityHashMap<>();
+    /** Non-owner scopes are closed on background workers so ServerLevel.close never waits on active fills. */
+    private static final java.util.Set<GpuWorldgenPolicy.WorldScope> RETIRING_FUSED_SCOPES =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** All fused interpolators ever registered, for shutdown release. */
     private static final java.util.Set<GpuFusedInterpolator> FUSED_PROGRAMS =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** A member's membership in a fused group: which fused program, and which root slot. */
-    private record FusedMembership(GpuFusedInterpolator fused, int rootIndex) {
+    private record FusedMembership(GpuFusedInterpolator fused, int rootIndex,
+                                   GpuWorldgenPolicy.WorldScope worldScope) {
+    }
+
+    private record PendingBatcherRegistration(GpuFusedInterpolator fused,
+                                              GpuWorldgenPolicy.WorldScope worldScope) {
+    }
+
+    private enum BatcherRetirementReason {
+        SUPERSEDED,
+        SCOPE_RETIRED
+    }
+
+    /** One retirement request/subscription for the exact owner generation being removed. */
+    private static final class BatcherRetirement {
+        final GpuChunkBatcher owner;
+        final GpuWorldgenPolicy.WorldScope worldScope;
+        final long generation;
+        final CountDownLatch cleanupComplete = new CountDownLatch(1);
+        volatile BatcherRetirementReason reason;
+        volatile GpuChunkBatcher.RetirementDisposition disposition;
+
+        BatcherRetirement(GpuChunkBatcher owner, GpuWorldgenPolicy.WorldScope worldScope,
+                          long generation, BatcherRetirementReason reason) {
+            this.owner = owner;
+            this.worldScope = worldScope;
+            this.generation = generation;
+            this.reason = reason;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -173,7 +213,8 @@ public final class ChunkGridCache {
     // ------------------------------------------------------------------
 
     /** A chunk lattice's pos-independent geometry (same field set as {@link GpuBatchStore.Key}). */
-    private record GeomKey(int oy, int sx, int sy, int sz, int dimX, int dimY, int dimZ) {
+    private record GeomKey(GpuWorldgenPolicy.WorldScope worldScope,
+                           int oy, int sx, int sy, int sz, int dimX, int dimY, int dimZ) {
     }
 
     /** Leak guard: distinct geometries are ~2 per dimension (full chunk + column probe). */
@@ -185,26 +226,48 @@ public final class ChunkGridCache {
 
     /** Records that a member of {@code fused} was requested on {@code ctx}'s lattice geometry. */
     private static void recordGeometry(GpuFusedInterpolator fused, Ctx ctx) {
-        if (fused == null || !ctx.extentOk) {
+        if (fused == null || !ctx.extentOk || ctx.worldScope == null) {
             return;
         }
-        recordGeometry(fused, new GeomKey(ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ));
+        recordGeometry(fused, new GeomKey(ctx.worldScope,
+                ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ));
     }
 
     /** As above but keyed directly — the async fusion build passes the discovery chunk's snapshot. */
     private static void recordGeometry(GpuFusedInterpolator fused, GeomKey key) {
-        if (fused == null || key == null) {
+        if (fused == null || key == null || key.worldScope() == null
+                || !GpuWorldgenPolicy.isWorldScopeLive(key.worldScope())) {
             return;
         }
         if (GEOM_GROUPS.size() >= MAX_GEOMETRIES && !GEOM_GROUPS.containsKey(key)) {
             return;   // pathological geometry churn — new geometries just keep the lazy path
         }
         GEOM_GROUPS.merge(key, fused, (prev, cur) -> cur.rootCount() > prev.rootCount() ? cur : prev);
+        // A close may have retired this scope after the initial liveness check. Do not
+        // leave a stale geometry pointing at a program the retirement callback can close.
+        if (!GpuWorldgenPolicy.isWorldScopeLive(key.worldScope())) {
+            GEOM_GROUPS.remove(key, fused);
+        }
     }
 
     /** The fused group registered for {@code ctx}'s lattice geometry, or {@code null} (lazy path). */
     private static GpuFusedInterpolator fusedForGeometry(Ctx ctx) {
-        return GEOM_GROUPS.get(new GeomKey(ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ));
+        return ctx.worldScope == null ? null : GEOM_GROUPS.get(new GeomKey(ctx.worldScope,
+                ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ));
+    }
+
+    /** Resolves the independently registered owner scope for the fused target of this lattice. */
+    private static FusedMembership fusedMembershipForGeometry(Ctx ctx) {
+        GpuFusedInterpolator fused = fusedForGeometry(ctx);
+        if (fused == null || ctx.worldScope == null) return null;
+        for (GpuDensityFunction member : fused.members()) {
+            FusedMembership membership = member == null ? null : FUSED_REGISTRY.get(member);
+            if (membership != null && membership.fused() == fused
+                    && membership.worldScope() == ctx.worldScope) {
+                return membership;
+            }
+        }
+        return null;
     }
 
     /**
@@ -214,9 +277,22 @@ public final class ChunkGridCache {
      * WRONG group's kernels over its lattice, the deposit would be consumed under member
      * identities the chunk never queries, and the waste would be counted as a batch serve.
      */
-    static boolean geometryMatchesBatcher(int oy, int sx, int sy, int sz, int dimX, int dimY, int dimZ) {
+    static boolean geometryMatchesBatcher(int oy, int sx, int sy, int sz, int dimX, int dimY, int dimZ,
+                                          GpuWorldgenPolicy.WorldScope worldScope) {
         GpuFusedInterpolator bf = batcherFused;
-        return bf != null && GEOM_GROUPS.get(new GeomKey(oy, sx, sy, sz, dimX, dimY, dimZ)) == bf;
+        GpuWorldgenPolicy.WorldScope ownerScope = batcherWorldScope();
+        return bf != null && worldScope != null && worldScope == ownerScope
+                && GEOM_GROUPS.get(new GeomKey(worldScope, oy, sx, sy, sz, dimX, dimY, dimZ)) == bf;
+    }
+
+    /** Independent target identity for callers submitting work to the global batcher. */
+    static GpuWorldgenPolicy.WorldScope batcherWorldScope() {
+        GpuChunkBatcher batcher = liveBatcher;
+        GpuFusedInterpolator fused = batcherFused;
+        GpuWorldgenPolicy.WorldScope scope = batcherScope;
+        return batcher != null && fused != null && scope != null
+                && RETIRING_BATCHER.get() != batcher
+                && GpuWorldgenPolicy.isWorldScopeLive(scope) ? scope : null;
     }
 
     // Cached inverse GEOM_GROUPS lookup for the batcher's fused group (climate-chain
@@ -233,14 +309,19 @@ public final class ChunkGridCache {
      * Used by the BIOMES-seam combined prefetch, where the chunk's {@code NoiseChunk}
      * does not exist yet.
      */
-    static GpuBatchStore.Extent canonicalBatcherExtent(net.minecraft.world.level.ChunkPos pos) {
+    static GpuBatchStore.Extent canonicalBatcherExtent(net.minecraft.world.level.ChunkPos pos,
+                                                       GpuWorldgenPolicy.WorldScope worldScope) {
         GpuFusedInterpolator bf = batcherFused;
-        if (bf == null || liveBatcher == null || pos == null) {
+        GpuWorldgenPolicy.WorldScope ownerScope = batcherWorldScope();
+        if (bf == null || ownerScope == null || pos == null || worldScope == null || worldScope != ownerScope) {
             return null;
         }
         GeomKey g = batcherGeomFor == bf ? batcherGeomKey : null;
         if (g == null) {
             for (Map.Entry<GeomKey, GpuFusedInterpolator> e : GEOM_GROUPS.entrySet()) {
+                if (e.getKey().worldScope() != worldScope) {
+                    continue;
+                }
                 if (e.getValue() == bf) {
                     g = e.getKey();
                     batcherGeomKey = g;
@@ -298,30 +379,76 @@ public final class ChunkGridCache {
     }
 
     /**
-     * Builds (or rebuilds) the live cross-chunk {@link GpuChunkBatcher} over the primary
-     * fused group's roots, so the noise prefetch can coalesce concurrent chunks into
-     * batched dispatches. Member {@code k}'s AST becomes batch root {@code k}, so a
-     * batched slice maps straight back onto {@code fused.members().get(k)}. No-op when
-     * batching is off, no fused group exists, or the batcher is already current. Never
-     * throws — on any failure the prefetch stays disabled and the per-chunk path runs.
+     * Builds the live cross-chunk {@link GpuChunkBatcher} over a fused group's roots, so
+     * the noise prefetch can coalesce concurrent chunks into batched dispatches. Within
+     * the current exact {@link GpuWorldgenPolicy.WorldScope}, a strictly larger root set
+     * may replace the owner only after the previous batcher becomes quiescent. Member
+     * {@code k}'s AST becomes batch root {@code k}. Never throws — on failure, the
+     * per-chunk path remains available.
      */
-    private static void ensureBatcher(GpuFusedInterpolator fused) {
-        if (!batchEnabled || fused == null) {
+    private static void ensureBatcher(GpuFusedInterpolator fused, GpuWorldgenPolicy.WorldScope worldScope) {
+        if (!batchEnabled || fused == null || worldScope == null
+                || GpuChunkBatcher.backendShutdownRequested()
+                || !GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
             return;
         }
+        java.util.List<GpuDensityFunction> candidateMembers = fused.members();
+        if (candidateMembers.isEmpty() || fused.rootCount() <= 0
+                || candidateMembers.stream().anyMatch(member -> member == null || member.sourceAst() == null)) {
+            LOGGER.warn("[SuperChunk-GPU] [batch] fused group is incomplete or has a member without source AST; "
+                    + "cross-chunk batching unavailable.");
+            return;
+        }
+        boolean installed = false;
         synchronized (BATCHER_LOCK) {
-            if (liveBatcher != null && batcherFused == fused) {
-                return; // already built for this exact group
+            BatcherRetirement retiring = batcherRetirement;
+            if (retiring != null) {
+                if (retiring.reason == BatcherRetirementReason.SUPERSEDED
+                        && retiring.owner == liveBatcher && worldScope == retiring.worldScope
+                        && batcherFused != null
+                        && isStrictlyBetterBatcherGroup(retiring.worldScope, batcherFused.rootCount(),
+                        worldScope, fused.rootCount())) {
+                    pendingSameScopeReplacement = betterSameScopeCandidate(
+                            pendingSameScopeReplacement, fused, worldScope);
+                } else if (worldScope != retiring.worldScope) {
+                    pendingBatcherRegistration = betterSameScopeCandidate(
+                            pendingBatcherRegistration, fused, worldScope);
+                }
+                return;
             }
-            java.util.List<GpuDensityFunction> members = fused.members();
-            java.util.List<AstNode> roots = new ArrayList<>(members.size());
-            for (GpuDensityFunction m : members) {
-                AstNode ast = m == null ? null : m.sourceAst();
-                if (ast == null) {
-                    LOGGER.warn("[SuperChunk-GPU] [batch] a fused member has no source AST — cross-chunk batching unavailable.");
+            if (liveBatcher != null) {
+                GpuWorldgenPolicy.WorldScope ownerScope = batcherScope;
+                if (ownerScope == worldScope && GpuWorldgenPolicy.isWorldScopeLive(ownerScope)) {
+                    if (batcherFused != null && fused != batcherFused
+                            && isStrictlyBetterBatcherGroup(ownerScope, batcherFused.rootCount(),
+                            worldScope, fused.rootCount())) {
+                        pendingSameScopeReplacement = betterSameScopeCandidate(
+                                pendingSameScopeReplacement, fused, worldScope);
+                        beginBatcherRetirement(liveBatcher, ownerScope, BatcherRetirementReason.SUPERSEDED);
+                    }
                     return;
                 }
-                roots.add(ast);
+                // Remember a candidate from another live scope too: it may register just
+                // before the current owner's close hook, and registerFused is not guaranteed
+                // to run again after the previous batcher finishes retiring.
+                pendingBatcherRegistration = betterSameScopeCandidate(
+                        pendingBatcherRegistration, fused, worldScope);
+                if (ownerScope == null || !GpuWorldgenPolicy.isWorldScopeLive(ownerScope)) {
+                    beginBatcherRetirement(liveBatcher, ownerScope, BatcherRetirementReason.SCOPE_RETIRED);
+                }
+                // One process-wide batcher remains the sole owner until both its drainer and
+                // completer have quiesced. A different live world takes the per-chunk route
+                // and will retry registration after retirement completes.
+                return;
+            }
+            if (RETIRING_BATCHER.get() != null) {
+                pendingBatcherRegistration = betterSameScopeCandidate(
+                        pendingBatcherRegistration, fused, worldScope);
+                return;
+            }
+            java.util.List<AstNode> roots = new ArrayList<>(candidateMembers.size());
+            for (GpuDensityFunction member : candidateMembers) {
+                roots.add(member.sourceAst());
             }
             GpuBatchDispatcher disp;
             try {
@@ -337,10 +464,16 @@ public final class ChunkGridCache {
                 LOGGER.warn("[SuperChunk-GPU] [batch] batched dispatcher did not compile — cross-chunk batching unavailable.");
                 return;
             }
+            // A world can close while the expensive dispatcher is compiling. Such a
+            // stale build must not capture the singleton slot or publish its program.
+            if (!GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+                disp.close();
+                return;
+            }
             GpuChunkBatcher b;
             try {
                 // init() shuts down + closes any prior SHARED batcher (different group).
-                b = GpuChunkBatcher.init(disp);
+                b = GpuChunkBatcher.init(disp, worldScope);
             } catch (Throwable t) {
                 LOGGER.warn("[SuperChunk-GPU] [batch] batcher init threw — cross-chunk batching unavailable.", t);
                 disp.close();
@@ -352,12 +485,262 @@ public final class ChunkGridCache {
                 return;
             }
             GpuBatchStore.clear(); // any grids from a prior (different-group) batcher are stale
-            liveBatcher = b;
             batcherFused = fused;
-            LOGGER.info("[SuperChunk-GPU] [batch] LIVE cross-chunk batching ENABLED: batcher built over the primary fused "
+            batcherScope = worldScope;
+            batcherGeneration++;
+            batcherGeomKey = null;
+            batcherGeomFor = null;
+            liveBatcher = b; // publish last: readers see a complete owner tuple
+            installed = true;
+            LOGGER.info("[SuperChunk-GPU] [batch] LIVE cross-chunk batching ENABLED: batcher bound to one world scope "
                             + "group (M={} roots, batchLimit={}, windowMicros={}). Concurrent chunks' density grids are now "
                             + "coalesced into BATCHED GPU dispatches with the worker freed during the wait.",
                     fused.rootCount(), b.batchLimit(), b.batchWindowMicros());
+        }
+        // Close may race the final install check. Re-read liveness after publishing and
+        // start asynchronous retirement if the owner was invalidated in that window.
+        if (installed && !GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+            retireStaleBatcher();
+        }
+    }
+
+    /** Pure selector seam: only exact same-scope candidates with strictly more roots win. */
+    static boolean isStrictlyBetterBatcherGroup(GpuWorldgenPolicy.WorldScope currentScope, int currentRoots,
+                                                 GpuWorldgenPolicy.WorldScope candidateScope, int candidateRoots) {
+        return currentScope != null && currentScope == candidateScope && candidateRoots > currentRoots;
+    }
+
+    private static PendingBatcherRegistration betterSameScopeCandidate(PendingBatcherRegistration current,
+                                                                        GpuFusedInterpolator candidate,
+                                                                        GpuWorldgenPolicy.WorldScope scope) {
+        if (candidate == null || scope == null) return current;
+        if (current == null || current.worldScope() != scope
+                || candidate.rootCount() > current.fused().rootCount()) {
+            return new PendingBatcherRegistration(candidate, scope);
+        }
+        return current;
+    }
+
+    /** Called by the ServerLevel.close hook after the policy has retired that level. */
+    public static void retireStaleBatcher() {
+        GpuWorldgenPolicy.WorldScope ownerScope;
+        synchronized (BATCHER_LOCK) {
+            BatcherRetirement retiring = batcherRetirement;
+            if (retiring != null && !GpuWorldgenPolicy.isWorldScopeLive(retiring.worldScope)) {
+                retiring.reason = BatcherRetirementReason.SCOPE_RETIRED;
+                pendingSameScopeReplacement = null;
+                ownerScope = retiring.worldScope;
+            } else {
+                GpuChunkBatcher owner = liveBatcher;
+                ownerScope = batcherScope;
+                if (owner != null && ownerScope != null
+                        && !GpuWorldgenPolicy.isWorldScopeLive(ownerScope)) {
+                    beginBatcherRetirement(owner, ownerScope, BatcherRetirementReason.SCOPE_RETIRED);
+                }
+            }
+        }
+        retireStaleFusedScopes(ownerScope);
+    }
+
+    /** Retires stale non-owner programs asynchronously; the global batch owner is cleaned after its drainer joins. */
+    private static void retireStaleFusedScopes(GpuWorldgenPolicy.WorldScope batchOwnerScope) {
+        if (GpuChunkBatcher.backendShutdownRequested()) return; // shutdownFused() owns terminal cleanup
+        java.util.Set<GpuWorldgenPolicy.WorldScope> scopes =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        synchronized (FUSED_LIFECYCLE_LOCK) {
+            for (java.util.Set<GpuWorldgenPolicy.WorldScope> owners : FUSED_SCOPE_OWNERS.values()) {
+                scopes.addAll(owners);
+            }
+            for (GeomKey key : GEOM_GROUPS.keySet()) scopes.add(key.worldScope());
+            for (FusedMembership membership : FUSED_REGISTRY.values()) scopes.add(membership.worldScope());
+        }
+        for (GpuWorldgenPolicy.WorldScope scope : scopes) {
+            if (scope == null || scope == batchOwnerScope || GpuWorldgenPolicy.isWorldScopeLive(scope)
+                    || !RETIRING_FUSED_SCOPES.add(scope)) {
+                continue;
+            }
+            try {
+                Thread cleanup = new Thread(() -> {
+                    try {
+                        retireFusedScope(scope);
+                    } finally {
+                        RETIRING_FUSED_SCOPES.remove(scope);
+                    }
+                }, "SuperChunk-GPU-fusion-retire-" + scope.id());
+                cleanup.setDaemon(true);
+                cleanup.start();
+            } catch (Throwable failure) {
+                RETIRING_FUSED_SCOPES.remove(scope);
+                LOGGER.warn("[SuperChunk-GPU] [fusion] could not start asynchronous cleanup for retired scope {}; "
+                        + "retaining it until backend shutdown.", scope.id(), failure);
+            }
+        }
+    }
+
+    /** Reserves and starts owner retirement without waiting on its workers or CL jobs. */
+    private static void beginBatcherRetirement(GpuChunkBatcher owner,
+                                               GpuWorldgenPolicy.WorldScope ownerScope,
+                                               BatcherRetirementReason reason) {
+        if (owner == null || ownerScope == null) return;
+        BatcherRetirement retirement;
+        synchronized (BATCHER_LOCK) {
+            if (reason == BatcherRetirementReason.SCOPE_RETIRED
+                    && GpuWorldgenPolicy.isWorldScopeLive(ownerScope)) {
+                return;
+            }
+            if (batcherRetirement != null) {
+                if (batcherRetirement.owner == owner
+                        && reason == BatcherRetirementReason.SCOPE_RETIRED) {
+                    batcherRetirement.reason = BatcherRetirementReason.SCOPE_RETIRED;
+                    pendingSameScopeReplacement = null;
+                }
+                return;
+            }
+            if (owner != liveBatcher || batcherScope != ownerScope
+                    || !RETIRING_BATCHER.compareAndSet(null, owner)) {
+                return;
+            }
+            retirement = new BatcherRetirement(owner, ownerScope, batcherGeneration, reason);
+            batcherRetirement = retirement;
+        }
+        requestBatcherRetirement(retirement);
+    }
+
+    /** Starts the idempotent retirement request and subscribes once for this owner generation. */
+    private static void requestBatcherRetirement(BatcherRetirement retirement) {
+        try {
+            GpuChunkBatcher.RetirementRequest request = retirement.owner.requestOwnerRetirement();
+            if (request == null || request.completion() == null) {
+                LOGGER.error("[SuperChunk-GPU] [batch] retirement returned no completion stage; "
+                        + "retaining the global owner slot fail-closed.");
+                retirement.cleanupComplete.countDown();
+                return;
+            }
+            retirement.disposition = request.disposition();
+            AtomicBoolean subscribing = new AtomicBoolean(true);
+            request.completion().whenComplete((result, failure) -> {
+                Runnable finalize = () -> finishBatcherRetirement(
+                        retirement, request.disposition(), result, failure);
+                if (subscribing.get()) {
+                    // An already-completed stage may invoke this on ServerLevel.close().
+                    // Keep the close hook non-blocking with a one-shot daemon finalizer.
+                    Thread thread = new Thread(finalize, "SuperChunk-GPU-batcher-finalize");
+                    thread.setDaemon(true);
+                    try {
+                        thread.start();
+                    } catch (Throwable startFailure) {
+                        LOGGER.error("[SuperChunk-GPU] [batch] could not start retirement finalizer; "
+                                + "retaining the global owner slot fail-closed.", startFailure);
+                        retirement.cleanupComplete.countDown();
+                    }
+                } else {
+                    // Normal completion is delivered by the batcher's own retirement thread.
+                    finalize.run();
+                }
+            });
+            subscribing.set(false);
+        } catch (Throwable failure) {
+            LOGGER.error("[SuperChunk-GPU] [batch] could not request owner retirement; "
+                    + "retaining the global owner slot fail-closed.", failure);
+            retirement.cleanupComplete.countDown();
+        }
+    }
+
+    /** Finalizes only after the batcher confirms that workers stopped and dispatcher close succeeded. */
+    private static void finishBatcherRetirement(BatcherRetirement retirement,
+                                                GpuChunkBatcher.RetirementDisposition disposition,
+                                                GpuChunkBatcher.RetirementResult result,
+                                                Throwable failure) {
+        try {
+            if (failure != null || result != GpuChunkBatcher.RetirementResult.QUIESCENT) {
+                LOGGER.error("[SuperChunk-GPU] [batch] owner retirement did not close cleanly; "
+                        + "the global slot remains unavailable.", failure);
+                return;
+            }
+
+            GpuFusedInterpolator oldFused;
+            synchronized (BATCHER_LOCK) {
+                if (batcherRetirement != retirement || liveBatcher != retirement.owner
+                        || batcherGeneration != retirement.generation) {
+                    LOGGER.error("[SuperChunk-GPU] [batch] stale retirement completion did not match its owner "
+                            + "generation; retaining the global slot fail-closed.");
+                    return;
+                }
+                if (!GpuWorldgenPolicy.isWorldScopeLive(retirement.worldScope)) {
+                    retirement.reason = BatcherRetirementReason.SCOPE_RETIRED;
+                    pendingSameScopeReplacement = null;
+                }
+                oldFused = batcherFused;
+                liveBatcher = null;
+                batcherFused = null;
+                batcherScope = null;
+                if (batcherGeomFor == oldFused) {
+                    batcherGeomKey = null;
+                    batcherGeomFor = null;
+                }
+            }
+
+            // The completer joined, so no late future can repopulate this store. This callback
+            // may run inline from a close hook only for a completed stage (handled above).
+            GpuBatchStore.clear();
+            boolean scopeCleanupDone = false;
+            while (true) {
+                boolean cleanupScopeNow = false;
+                synchronized (BATCHER_LOCK) {
+                    if (batcherRetirement != retirement) return;
+                    if (!GpuWorldgenPolicy.isWorldScopeLive(retirement.worldScope)) {
+                        retirement.reason = BatcherRetirementReason.SCOPE_RETIRED;
+                        pendingSameScopeReplacement = null;
+                    }
+                    if (retirement.reason == BatcherRetirementReason.SCOPE_RETIRED && !scopeCleanupDone) {
+                        cleanupScopeNow = true;
+                    } else {
+                        boolean backendTerminal = GpuChunkBatcher.backendShutdownRequested()
+                                || disposition == GpuChunkBatcher.RetirementDisposition.BACKEND_TERMINAL;
+                        PendingBatcherRegistration next = null;
+                        if (!backendTerminal) {
+                            if (retirement.reason == BatcherRetirementReason.SUPERSEDED
+                                    && GpuWorldgenPolicy.isWorldScopeLive(retirement.worldScope)) {
+                                PendingBatcherRegistration replacement = pendingSameScopeReplacement;
+                                pendingSameScopeReplacement = null;
+                                if (replacement != null && oldFused != null
+                                        && replacement.worldScope() == retirement.worldScope
+                                        && isStrictlyBetterBatcherGroup(retirement.worldScope, oldFused.rootCount(),
+                                        replacement.worldScope(), replacement.fused().rootCount())
+                                        && GpuWorldgenPolicy.isWorldScopeLive(replacement.worldScope())) {
+                                    next = replacement;
+                                }
+                            } else {
+                                next = pendingBatcherRegistration;
+                                pendingBatcherRegistration = null;
+                                pendingSameScopeReplacement = null;
+                            }
+                        } else {
+                            pendingBatcherRegistration = null;
+                            pendingSameScopeReplacement = null;
+                        }
+
+                        // Keep the global slot reserved through full-scope cleanup. A same-scope
+                        // upgrade must preserve the scope's fused registry and geometry membership.
+                        batcherRetirement = null;
+                        RETIRING_BATCHER.compareAndSet(retirement.owner, null);
+                        if (next != null && batchEnabled && !backendTerminal
+                                && GpuWorldgenPolicy.isWorldScopeLive(next.worldScope())) {
+                            // Reentrant under BATCHER_LOCK: no competing registration can install a
+                            // less complete candidate in the gap before this selected one is built.
+                            ensureBatcher(next.fused(), next.worldScope());
+                        }
+                        break;
+                    }
+                }
+                if (cleanupScopeNow) {
+                    // This is deliberately outside BATCHER_LOCK: close() may wait for direct fills.
+                    retireFusedScope(retirement.worldScope);
+                    scopeCleanupDone = true;
+                }
+            }
+        } finally {
+            retirement.cleanupComplete.countDown();
         }
     }
 
@@ -367,36 +750,121 @@ public final class ChunkGridCache {
      * dispatch when any member's grid is first requested. Idempotent-ish (re-maps a
      * member to the latest fused group). Safe to call from the router-compile thread.
      */
-    public static void registerFused(GpuFusedInterpolator fused) {
-        if (fused == null) {
+    public static void registerFused(GpuFusedInterpolator fused, GpuWorldgenPolicy.WorldScope worldScope) {
+        if (fused == null || worldScope == null) {
             return;
         }
-        FUSED_PROGRAMS.add(fused);
+        if (!GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+            closeFusedIfUnreferenced(fused);
+            return;
+        }
         java.util.List<GpuDensityFunction> members = fused.members();
-        for (int k = 0; k < members.size(); k++) {
-            GpuDensityFunction m = members.get(k);
-            if (m != null) {
-                FUSED_REGISTRY.put(m, new FusedMembership(fused, k));
+        synchronized (FUSED_LIFECYCLE_LOCK) {
+            if (!GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+                closeFusedIfUnreferencedLocked(fused);
+                return;
+            }
+            FUSED_PROGRAMS.add(fused);
+            FUSED_SCOPE_OWNERS.computeIfAbsent(fused,
+                    ignored -> java.util.Collections.newSetFromMap(new IdentityHashMap<>())).add(worldScope);
+            for (int k = 0; k < members.size(); k++) {
+                GpuDensityFunction m = members.get(k);
+                if (m != null) {
+                    FUSED_REGISTRY.put(m, new FusedMembership(fused, k, worldScope));
+                }
             }
         }
-        // Pick the fused group with the most roots as the BATCHER's group (realistically
-        // the main dimension's interpolated-grids group). Members of any other group get
-        // their own geometry-resolved eager/blocking fused path (see fusedForGeometry);
-        // only the cross-chunk batcher is bound to this single group.
-        GpuFusedInterpolator pf = primaryFused;
-        if (pf == null || fused.rootCount() > pf.rootCount()) {
-            primaryFused = fused;
+        // Compilation can finish concurrently with ServerLevel.close(). Remove a group
+        // that lost authorization before it becomes visible to any consumer.
+        if (!GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+            if (liveBatcher != null && batcherScope == worldScope && batcherFused == fused) {
+                // This program may be referenced by the global primary dispatcher. Defer
+                // unregister/close until the batcher has stopped its drainer/completer.
+                retireStaleBatcher();
+            } else {
+                retireFusedScope(worldScope);
+            }
+            return;
         }
         LOGGER.info("[SuperChunk-GPU] [fusion] registered fused interpolator (M={} whole-grid DFs -> 1 dispatch/chunk).",
                 members.size());
-        // LIVE cross-chunk batching: (re)build the batcher over the (possibly updated)
-        // primary fused group so the noise prefetch can coalesce concurrent chunks.
+        // LIVE cross-chunk batching binds once to a single authorized world scope.
         // No-op unless batchChunks is on; never throws.
         if (batchEnabled) {
             try {
-                ensureBatcher(primaryFused);
+                // One process-wide batcher can own only one world's compiled root set.
+                // The first eligible scope remains its owner while requests may be in flight;
+                // later scopes keep their own per-chunk route and cannot rebind this batcher.
+                ensureBatcher(fused, worldScope);
             } catch (Throwable t) {
                 LOGGER.warn("[SuperChunk-GPU] [batch] ensureBatcher threw — cross-chunk batching stays off.", t);
+            }
+        }
+    }
+
+    /** Removes retired-scope program references, closing only groups with no remaining owner. */
+    private static void retireFusedScope(GpuWorldgenPolicy.WorldScope retiredScope) {
+        if (retiredScope == null) return;
+        synchronized (FUSED_LIFECYCLE_LOCK) {
+            java.util.Set<GpuFusedInterpolator> candidates =
+                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            GEOM_GROUPS.entrySet().removeIf(entry -> {
+                if (entry.getKey().worldScope() == retiredScope) {
+                    candidates.add(entry.getValue());
+                    return true;
+                }
+                return false;
+            });
+            FUSED_REGISTRY.entrySet().removeIf(entry -> {
+                FusedMembership membership = entry.getValue();
+                if (membership.worldScope() == retiredScope) {
+                    candidates.add(membership.fused());
+                    return true;
+                }
+                return false;
+            });
+            java.util.Iterator<Map.Entry<GpuFusedInterpolator, java.util.Set<GpuWorldgenPolicy.WorldScope>>> owners =
+                    FUSED_SCOPE_OWNERS.entrySet().iterator();
+            while (owners.hasNext()) {
+                Map.Entry<GpuFusedInterpolator, java.util.Set<GpuWorldgenPolicy.WorldScope>> entry = owners.next();
+                if (entry.getValue().remove(retiredScope)) candidates.add(entry.getKey());
+                if (entry.getValue().isEmpty()) owners.remove();
+            }
+            for (GpuFusedInterpolator candidate : candidates) {
+                if (!isFusedReferencedLocked(candidate)) {
+                    FUSED_PROGRAMS.remove(candidate);
+                    try {
+                        candidate.close();
+                    } catch (Throwable failure) {
+                        LOGGER.warn("[SuperChunk-GPU] [fusion] failed to release retired fused program.", failure);
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean isFusedReferencedLocked(GpuFusedInterpolator candidate) {
+        for (FusedMembership membership : FUSED_REGISTRY.values()) {
+            if (membership.fused() == candidate) return true;
+        }
+        return GEOM_GROUPS.containsValue(candidate)
+                || !FUSED_SCOPE_OWNERS.getOrDefault(candidate, java.util.Set.of()).isEmpty();
+    }
+
+    private static void closeFusedIfUnreferenced(GpuFusedInterpolator fused) {
+        synchronized (FUSED_LIFECYCLE_LOCK) {
+            closeFusedIfUnreferencedLocked(fused);
+        }
+    }
+
+    /** Caller holds {@link #FUSED_LIFECYCLE_LOCK}. */
+    private static void closeFusedIfUnreferencedLocked(GpuFusedInterpolator fused) {
+        if (fused != null && !isFusedReferencedLocked(fused)) {
+            FUSED_PROGRAMS.remove(fused);
+            try {
+                fused.close();
+            } catch (Throwable failure) {
+                LOGGER.warn("[SuperChunk-GPU] [fusion] failed to release unregistered fused program.", failure);
             }
         }
     }
@@ -408,35 +876,62 @@ public final class ChunkGridCache {
      * resource-owner shutdown loop closing them again is a no-op.
      */
     public static void shutdownFused() {
-        FUSED_REGISTRY.clear();
-        GEOM_GROUPS.clear();
-        primaryFused = null;
-        // Cross-chunk batching: drop our refs + the grid store. The batcher instance
-        // itself (== GpuChunkBatcher.SHARED) is stopped/closed by
-        // GpuChunkBatcher.shutdownShared() later in OpenCLBackend.shutdown().
-        liveBatcher = null;
-        batcherFused = null;
-        // NOTE: the batch store / field pool are intentionally NOT cleared here.
-        // shutdownFused() runs BEFORE GpuChunkBatcher.shutdownShared() in
-        // OpenCLBackend.shutdown(), so the batcher drainer thread can still be live
-        // and land a whenComplete put() into GpuBatchStore.STORE after this point.
-        // Clearing them here would leak those late grids/holders. The stores are
-        // instead cleared by clearBatchStore(), called AFTER shutdownShared() joins
-        // the drainer (see OpenCLBackend.shutdown()).
-        for (GpuFusedInterpolator fused : FUSED_PROGRAMS) {
-            try {
-                fused.close();
-            } catch (Throwable ignored) {
+        awaitBatcherRetirementCleanup();
+        synchronized (FUSED_LIFECYCLE_LOCK) {
+            FUSED_REGISTRY.clear();
+            GEOM_GROUPS.clear();
+            FUSED_SCOPE_OWNERS.clear();
+            // Cross-chunk batching: drop our refs + the grid store. The batcher instance
+            // itself is stopped/closed before this method during OpenCLBackend.shutdown().
+            synchronized (BATCHER_LOCK) {
+                liveBatcher = null;
+                batcherFused = null;
+                batcherScope = null;
+                batcherGeomKey = null;
+                batcherGeomFor = null;
+                pendingBatcherRegistration = null;
+                pendingSameScopeReplacement = null;
+                batcherRetirement = null;
+                RETIRING_BATCHER.set(null);
+                batcherGeneration++;
             }
+            // NOTE: the batch store / field pool are intentionally NOT cleared here.
+            // It is cleared by clearBatchStore() after the batcher has joined.
+            for (GpuFusedInterpolator fused : FUSED_PROGRAMS) {
+                try {
+                    fused.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            FUSED_PROGRAMS.clear();
+            SEEN_WHOLEGRID.clear();
         }
-        FUSED_PROGRAMS.clear();
-        SEEN_WHOLEGRID.clear();
+    }
+
+    /** Backend shutdown waits for manager cleanup after the batcher's own completion stage. */
+    private static void awaitBatcherRetirementCleanup() {
+        boolean interrupted = false;
+        while (true) {
+            BatcherRetirement retirement = batcherRetirement;
+            if (retirement == null) break;
+            while (true) {
+                try {
+                    retirement.cleanupComplete.await();
+                    break;
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            // A failed close intentionally keeps the slot reserved during normal runtime.
+            // Backend shutdown may proceed once its finalizer has stopped touching the maps.
+            if (batcherRetirement == retirement) break;
+        }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     /**
      * Drops the cross-chunk batch store and its pooled field buffers. Called from
-     * {@code OpenCLBackend.shutdown()} AFTER {@link GpuChunkBatcher#shutdownShared()}
-     * has joined the batcher drainer thread, so no late {@code whenComplete} put()
+     * {@code OpenCLBackend.shutdown()} AFTER the batcher has been joined, so no late {@code whenComplete} put()
      * can race a stored grid/holder in after the clear (which would leak in the
      * static {@link GpuBatchStore} map). Split out of {@link #shutdownFused} for
      * exactly this ordering guarantee.
@@ -463,6 +958,8 @@ public final class ChunkGridCache {
     /** Per-thread context: the chunk currently being interpolated + its grids. */
     private static final class Ctx {
         NoiseChunk chunk;
+        GpuWorldgenPolicy.Permit permit;
+        GpuWorldgenPolicy.WorldScope worldScope;
         // whole-chunk cell-corner lattice extent (block coords).
         int ox, oy, oz;            // origin block coords (first cell corner)
         int sx, sy, sz;            // strides (cellWidth, cellHeight, cellWidth)
@@ -537,13 +1034,6 @@ public final class ChunkGridCache {
      * chunk evicts the previous chunk's grids (bounded memory).
      */
     public static void beginChunk(NoiseChunk chunk) {
-        // STAGE 2 on-device interpolation: bind the per-thread GPU full-field context to
-        // this chunk (no-op unless -Dsuperchunk.gpu.onDeviceInterp[.verify]). Done before
-        // the `enabled` guard so begin/endChunk stay symmetric even if coalescing is off.
-        OnDeviceInterp.beginChunk(chunk);
-        if (!enabled) {
-            return;
-        }
         Ctx ctx = CTX.get();
         // New chunk (or re-entry) -> discard any stale in-flight async dispatch, then
         // drop the old grids and rebind.
@@ -551,7 +1041,25 @@ public final class ChunkGridCache {
         ctx.grids.clear();
         ctx.chunkWholeGrid.clear();
         ctx.chunk = chunk;
+        ctx.permit = GpuWorldgenPolicy.currentPermit();
+        ctx.worldScope = ctx.permit == null ? null : ctx.permit.worldScope();
         ctx.extentOk = false;
+        // Unproved/noise-independent sampler contexts are deliberately CPU-only. Do not
+        // bind OnDeviceInterp either: that is a separate GPU consumer of these grids.
+        if (chunk == null || ctx.permit == null
+                || !ctx.permit.allows(GpuWorldgenPolicy.DispatchPath.CHUNK_GRID)) {
+            OnDeviceInterp.endChunk();
+            ctx.chunk = null;
+            ctx.permit = null;
+            ctx.worldScope = null;
+            return;
+        }
+        // Bind after authorization and before deriving extents; a denied task never owns
+        // a GPU field context even if its NoiseChunk mixin still runs begin/end hooks.
+        OnDeviceInterp.beginChunk(chunk);
+        if (!enabled) {
+            return;
+        }
         try {
             IChunkNoiseSampler s = (IChunkNoiseSampler) chunk;
             int cellWidth = s.getHorizontalCellBlockCount();
@@ -615,7 +1123,7 @@ public final class ChunkGridCache {
         // dispatch path the batched design claims doesn't happen. Column probes and
         // sub-region samplers ((dim-1)*stride != 16) are excluded: nothing should have
         // prefetched those. Pure observability; the serve path is unchanged.
-        if (batchEnabled && ctx.extentOk && liveBatcher != null
+        if (batchEnabled && ctx.extentOk && liveBatcher != null && batcherWorldScope() == ctx.worldScope
                 && (ctx.dimX - 1) * ctx.sx == 16 && (ctx.dimZ - 1) * ctx.sz == 16) {
             GpuFillStats.recordBatchMiss();
         }
@@ -651,16 +1159,18 @@ public final class ChunkGridCache {
             // (same fields the prefetch keyed the deposit with), so we can only ever peek/take THIS
             // dimension's entry — a concurrently-generating other dimension at (x,z) has a different
             // key and cannot alias it.
-            GpuBatchStore.Key key = GpuBatchStore.key(pos,
+            GpuBatchStore.Key key = GpuBatchStore.key(pos, ctx.worldScope,
                     ctx.ox, ctx.oy, ctx.oz, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ);
             GpuBatchStore.Stored sg = GpuBatchStore.get(key);   // PEEK (no remove yet)
             if (sg == null) {
                 return false;
             }
-            GpuFusedInterpolator fused = primaryFused;
-            // Only serve when the stored grids belong to the CURRENT primary fused group
-            // (and hence the current batcher) — otherwise member<->root mapping is stale.
-            if (fused == null || sg.fused != fused || sg.fused != batcherFused) {
+            GpuFusedInterpolator fused = batcherFused;
+            GpuWorldgenPolicy.WorldScope targetScope = batcherWorldScope();
+            // Only serve when the stored grids belong to the currently installed batcher
+            // and the deposit's scope token matched this world at lookup.
+            if (fused == null || targetScope == null || targetScope != ctx.worldScope
+                    || sg.worldScope() != targetScope || sg.fused != fused) {
                 return false;
             }
             GpuBatchStore.Extent ext = sg.ext;
@@ -683,6 +1193,10 @@ public final class ChunkGridCache {
             GpuBatchStore.Stored taken = GpuBatchStore.take(key);
             if (taken == null) {
                 return false;   // raced with an evict/cancel -> per-chunk path (nothing consumed)
+            }
+            if (taken.worldScope() != targetScope || taken.fused != fused) {
+                if (taken.field != null) OnDeviceFieldPool.release(taken.field);
+                return false;
             }
             OnDeviceFieldPool.Holder holder = taken.field;
             boolean holderServed = false;
@@ -756,9 +1270,9 @@ public final class ChunkGridCache {
      * dispatch fails.
      *
      * <p>CROSS-DIMENSION FIX (2026-07-02): the group is resolved from {@code ctx}'s
-     * lattice geometry (see {@link #recordGeometry}), NOT the global {@link #primaryFused}.
-     * The old primaryFused dispatch fired the WRONG dimension's fused program for every
-     * non-primary-dimension chunk and probe — structurally unconsumable
+     * lattice geometry and world token (see {@link #recordGeometry}), not a single global
+     * fused group. The old primary-group dispatch fired the WRONG dimension's fused program
+     * for every non-primary-dimension chunk and probe — structurally unconsumable
      * ({@code pending.fused()} never matched the chunk's own group), then BLOCKED on the
      * wasted readback at endChunk's discard. Now a nether/end chunk eagerly dispatches
      * its OWN group (consumable, same math its blocking path would run), and an
@@ -766,18 +1280,27 @@ public final class ChunkGridCache {
      * pre-discovery window (at most the FIRST chunk of a (group, geometry) pair).
      */
     private static void maybeDispatchAsync(Ctx ctx) {
-        if (!asyncEnabled || !fusionEnabled || !ctx.extentOk) {
+        if (!asyncEnabled || !fusionEnabled || !ctx.extentOk || ctx.permit == null) {
             return;
         }
-        GpuFusedInterpolator fused = fusedForGeometry(ctx);
-        if (fused == null) {
+        FusedMembership target = fusedMembershipForGeometry(ctx);
+        if (target == null || target.worldScope() == null
+                || target.worldScope() != ctx.worldScope
+                || !GpuWorldgenPolicy.isWorldScopeLive(target.worldScope())
+                || !GpuWorldgenPolicy.isAuthorizedInScope(ctx.permit,
+                        GpuWorldgenPolicy.DispatchPath.CHUNK_GRID, target.worldScope())) {
             return;
         }
+        GpuFusedInterpolator fused = target.fused();
         try {
-            ctx.pendingAsync = fused.dispatchAsync(
-                    ctx.ox, ctx.oy, ctx.oz,
-                    ctx.sx, ctx.sy, ctx.sz,
-                    ctx.dimX, ctx.dimY, ctx.dimZ);   // may be null on failure -> lazy path
+            if (!GpuWorldgenPolicy.dispatchIfAuthorizedInScope(ctx.permit,
+                    GpuWorldgenPolicy.DispatchPath.CHUNK_GRID, target.worldScope(),
+                    () -> ctx.pendingAsync = fused.dispatchAsync(
+                            ctx.ox, ctx.oy, ctx.oz,
+                            ctx.sx, ctx.sy, ctx.sz,
+                            ctx.dimX, ctx.dimY, ctx.dimZ))) {
+                return;
+            }
             if (ctx.pendingAsync != null) {
                 GpuFillStats.recordAsyncIssued();
             }
@@ -811,10 +1334,17 @@ public final class ChunkGridCache {
         // STAGE 2 on-device interpolation: unbind this thread's GPU full-field context
         // (no-op unless the flag is on). Symmetric with beginChunk above.
         OnDeviceInterp.endChunk();
+        Ctx ctx = CTX.get();
         if (!enabled) {
+            discardPending(ctx);
+            ctx.grids.clear();
+            ctx.chunkWholeGrid.clear();
+            ctx.chunk = null;
+            ctx.permit = null;
+            ctx.worldScope = null;
+            ctx.extentOk = false;
             return;
         }
-        Ctx ctx = CTX.get();
         // ASYNC readback: if a pending eager dispatch was never consumed (chunk
         // abandoned before any density use), wait for its readback to finish and
         // release it — no orphan events, no leaked buffer, no torn reuse next chunk.
@@ -831,6 +1361,8 @@ public final class ChunkGridCache {
         ctx.grids.clear();
         ctx.chunkWholeGrid.clear();
         ctx.chunk = null;
+        ctx.permit = null;
+        ctx.worldScope = null;
         ctx.extentOk = false;
     }
 
@@ -854,12 +1386,14 @@ public final class ChunkGridCache {
      * @param n   number of points in this column
      */
     public static boolean tryServe(GpuDensityFunction gpu, double[] out,
-                                   int[] x, int[] y, int[] z, int n) {
+                                   int[] x, int[] y, int[] z, int n,
+                                   GpuWorldgenPolicy.Permit permit) {
         if (!enabled || n <= 0) {
             return false;
         }
         Ctx ctx = CTX.get();
-        if (!ctx.extentOk || ctx.chunk == null) {
+        if (!ctx.extentOk || ctx.chunk == null || permit == null || permit != ctx.permit
+                || !permit.allows(GpuWorldgenPolicy.DispatchPath.CHUNK_GRID)) {
             return false;
         }
 
@@ -960,8 +1494,12 @@ public final class ChunkGridCache {
         // at endChunk (the set of whole-grid DFs a chunk actually exercises).
         if (fusionEnabled) {
             FusedMembership fm = FUSED_REGISTRY.get(gpu);
-            if (fm != null) {
-                Grid g = computeFusedGroup(ctx, fm.fused(), gpu);
+            if (fm != null && fm.worldScope() == ctx.worldScope
+                    && GpuWorldgenPolicy.isWorldScopeLive(fm.worldScope())
+                    && ctx.permit != null
+                    && GpuWorldgenPolicy.isAuthorizedInScope(ctx.permit,
+                            GpuWorldgenPolicy.DispatchPath.CHUNK_GRID, fm.worldScope())) {
+                Grid g = computeFusedGroup(ctx, fm, gpu);
                 if (g != null) {
                     return g;
                 }
@@ -999,7 +1537,16 @@ public final class ChunkGridCache {
      * per-DF coalesced grid for each member). Returns {@code null} on failure (the
      * caller then runs the per-DF whole-grid path for {@code requested}).
      */
-    private static Grid computeFusedGroup(Ctx ctx, GpuFusedInterpolator fused, GpuDensityFunction requested) {
+    private static Grid computeFusedGroup(Ctx ctx, FusedMembership membership,
+                                          GpuDensityFunction requested) {
+        GpuFusedInterpolator fused = membership.fused();
+        GpuWorldgenPolicy.WorldScope targetScope = membership.worldScope();
+        if (ctx.permit == null || targetScope == null || targetScope != ctx.worldScope
+                || !GpuWorldgenPolicy.isWorldScopeLive(targetScope)
+                || !GpuWorldgenPolicy.isAuthorizedInScope(ctx.permit,
+                        GpuWorldgenPolicy.DispatchPath.CHUNK_GRID, targetScope)) {
+            return null;
+        }
         // A member of `fused` was genuinely requested on this lattice geometry — record
         // the (geometry -> group) proof so beginChunk's eager dispatch / the batch
         // prefetch can target the RIGHT group for future chunks of this geometry.
@@ -1028,17 +1575,41 @@ public final class ChunkGridCache {
         // stores nothing and the buffer is re-overwritten by the next fill before any read.
         // ctx.grids is cleared at endChunk. Bit-identical to the fresh-array path.
         double[][] out = ensureGridsBuf(ctx, fused, m, len);
-        boolean ok;
+        boolean[] dispatchedResult = new boolean[1];
         try {
-            ok = fused.fillAllGrids(out,
-                    ctx.ox, ctx.oy, ctx.oz,
-                    ctx.sx, ctx.sy, ctx.sz,
-                    ctx.dimX, ctx.dimY, ctx.dimZ);
+            boolean admitted = GpuWorldgenPolicy.dispatchIfAuthorizedInScope(ctx.permit,
+                    GpuWorldgenPolicy.DispatchPath.CHUNK_GRID, targetScope,
+                    () -> dispatchedResult[0] = fused.fillAllGrids(out,
+                            ctx.ox, ctx.oy, ctx.oz,
+                            ctx.sx, ctx.sy, ctx.sz,
+                            ctx.dimX, ctx.dimY, ctx.dimZ));
+            if (!admitted) {
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_REJECTED);
+                if (ctx.worldScope != targetScope) {
+                    GpuAuthorizationDiagnostics.record(
+                            GpuAuthorizationDiagnostics.Event.DENSITY_WORLD_CONTEXT_MISMATCH);
+                } else {
+                    GpuAuthorizationDiagnostics.recordDensityAuthorizationFailure(
+                            GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                                    null, null, null, GpuWorldgenPolicy.DispatchPath.CHUNK_GRID));
+                }
+                return null;
+            }
         } catch (Throwable t) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_FAILED);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
             LOGGER.warn("[SuperChunk-GPU] [fusion] fused dispatch threw — per-DF whole-grid fallback for this chunk.", t);
             return null;
         }
+        boolean ok = dispatchedResult[0];
         if (!ok) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_FAILED);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
             return null;
         }
         Grid requestedGrid = null;
@@ -1054,6 +1625,8 @@ public final class ChunkGridCache {
             }
         }
         GpuFillStats.recordFusedDispatch(m);
+        GpuAuthorizationDiagnostics.record(
+                GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_COMPLETED);
         // If the requested DF somehow wasn't a member, fall back (shouldn't happen:
         // the registry only maps members to their own group).
         return requestedGrid;
@@ -1095,10 +1668,18 @@ public final class ChunkGridCache {
             ok = pending.completeRecordingAsyncServe(out);
         } catch (Throwable t) {
             pending.discard();   // idempotent if complete() already consumed it
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_FAILED);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
             LOGGER.warn("[SuperChunk-GPU] [fusion] async fused completion threw — blocking fallback for this chunk.", t);
             return null;
         }
         if (!ok) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_FAILED);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
             return null;
         }
         java.util.List<GpuDensityFunction> members = fused.members();
@@ -1115,6 +1696,8 @@ public final class ChunkGridCache {
             }
         }
         GpuFillStats.recordFusedDispatch(m);
+        GpuAuthorizationDiagnostics.record(
+                GpuAuthorizationDiagnostics.Event.DENSITY_FUSED_DISPATCH_COMPLETED);
         return requestedGrid;
     }
 
@@ -1175,11 +1758,13 @@ public final class ChunkGridCache {
         // thread-local mutable state that endChunk clears right after this call, so the
         // build thread must not touch it. The snapshot preserves the old inline build's
         // "no one-chunk warmup gap" geometry warming.
-        GeomKey discoveryGeom = ctx.extentOk
-                ? new GeomKey(ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ)
+        GpuWorldgenPolicy.WorldScope discoveryScope = ctx.worldScope;
+        GeomKey discoveryGeom = ctx.extentOk && discoveryScope != null
+                ? new GeomKey(discoveryScope, ctx.oy, ctx.sx, ctx.sy, ctx.sz, ctx.dimX, ctx.dimY, ctx.dimZ)
                 : null;
         try {
-            Thread builder = new Thread(() -> buildFusion(members, asts, discoveryGeom), "SuperChunk-GPU-fusion-build");
+            Thread builder = new Thread(() -> buildFusion(members, asts, discoveryGeom, discoveryScope),
+                    "SuperChunk-GPU-fusion-build");
             builder.setDaemon(true);
             builder.start();
         } catch (Throwable t) {
@@ -1189,7 +1774,8 @@ public final class ChunkGridCache {
     }
 
     /** The background half of {@link #maybeBuildFusion}. Runs off the worker threads. */
-    private static void buildFusion(List<GpuDensityFunction> members, List<AstNode> asts, GeomKey discoveryGeom) {
+    private static void buildFusion(List<GpuDensityFunction> members, List<AstNode> asts,
+                                    GeomKey discoveryGeom, GpuWorldgenPolicy.WorldScope worldScope) {
         try {
             if (!OpenCLBackend.isAvailable()) {
                 return;   // world tearing down — don't compile into a dead backend
@@ -1209,7 +1795,7 @@ public final class ChunkGridCache {
             if (fused != null) {
                 // A shutdown racing the compile is safe: registration into a shutting-down
                 // backend self-closes the owner (OpenCLBackend.registerResourceOwner).
-                registerFused(fused);
+                registerFused(fused, worldScope);
                 recordGeometry(fused, discoveryGeom);
                 LOGGER.info("[SuperChunk-GPU] [fusion] LIVE DF fusion ENABLED: {} whole-grid DFs -> ONE multi-output "
                         + "dispatch/chunk (replaces {} per-DF whole-grid dispatches/chunk).", members.size(), members.size());

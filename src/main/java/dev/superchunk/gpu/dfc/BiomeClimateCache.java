@@ -263,7 +263,7 @@ public final class BiomeClimateCache {
      * registry key). {@code veg}/{@code depth} are {@code null} when excluded (e.g. the
      * overworld {@code depth} contains a spline that is not float-bit-identical).
      */
-    private record Group(GpuFusedInterpolator fused,
+    private record Group(NoiseRouter sourceRouter, GpuFusedInterpolator fused,
                          GpuDensityFunction temp, GpuDensityFunction veg, GpuDensityFunction depth,
                          int rootTemp, int rootVeg, int rootDepth, int backedCount,
                          GpuBatchDispatcher batchDisp, List<AstNode> batchRoots) {
@@ -422,7 +422,7 @@ public final class BiomeClimateCache {
             // A root dropped by the fused-output gate keeps its slot in the fused program (it is
             // still computed, just unused) but is registered with root index -1 + member null,
             // so serve() returns NaN for it and the CPU computes it exactly as vanilla.
-            REGISTRY.put(gt, new Group(fused, gt, serveV ? gv : null, serveD ? gd : null,
+            REGISTRY.put(gt, new Group(router, fused, gt, serveV ? gv : null, serveD ? gd : null,
                     rt, serveV ? rv : -1, serveD ? rd : -1, servedCount, batchDisp,
                     batchDisp != null ? List.copyOf(roots) : null));
             StringBuilder on = new StringBuilder("temperature");
@@ -509,7 +509,7 @@ public final class BiomeClimateCache {
                 LOGGER.info("[SuperChunk-GPU] [biome-batch] fp32 climate dispatcher not accepted for {} — "
                         + "using the fp64 dispatcher.", dimLabel());
             }
-            d = GpuBatchDispatcher.compile(roots);
+            d = GpuBatchDispatcher.compileClimate(roots);
             if (d == null) {
                 LOGGER.info("[SuperChunk-GPU] [biome-batch] batched climate program did not build for {} — "
                         + "per-chunk climate dispatch for this dimension.", dimLabel());
@@ -733,7 +733,8 @@ public final class BiomeClimateCache {
     public record ClimatePlan(GpuChunkBatcher batcher, GpuBatchDispatcher disp,
                               GpuClimateStore.Key key, int expectLen,
                               int ox, int oy, int oz, int dimX, int dimY, int dimZ,
-                              List<AstNode> chainRoots) {
+                              List<AstNode> chainRoots, NoiseRouter sourceRouter,
+                              GpuFusedInterpolator targetFused) {
         // chainRoots: the gated batched program's exact roots (Group.batchRoots) — what
         // the climate CHAIN attaches with (see GpuBatchDispatcher.attachClimateChain).
     }
@@ -751,6 +752,13 @@ public final class BiomeClimateCache {
         if (!enabled || !BATCH_CLIMATE || chunk == null || router == null || !OpenCLBackend.isAvailable()) {
             return null;
         }
+        GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.forChunk(chunk, null);
+        if (!GpuWorldgenPolicy.isAuthorized(permit, GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH)) {
+            return null;
+        }
+        if (!permit.matchesRouter(router)) {
+            return null;
+        }
         GpuChunkBatcher batcher = climateSubmitBatcher();
         if (batcher == null) {
             return null;
@@ -761,7 +769,8 @@ public final class BiomeClimateCache {
                 return null;
             }
             Group g = REGISTRY.get(t);
-            if (g == null || g.batchDisp() == null) {
+            if (g == null || g.batchDisp() == null || g.sourceRouter() != router
+                    || !permit.matchesRouter(g.sourceRouter())) {
                 return null;
             }
             ChunkPos cp = chunk.getPos();
@@ -777,17 +786,52 @@ public final class BiomeClimateCache {
             if (len <= 0 || len > MAX_GRID_LEN) {
                 return null;
             }
-            GpuClimateStore.Key key = new GpuClimateStore.Key(cp.toLong(), oyQuart, dimY, g.fused());
+            GpuClimateStore.Key key = new GpuClimateStore.Key(permit.worldScope(),
+                    cp.toLong(), oyQuart, dimY, g.fused());
             long expect = (long) g.fused().rootCount() * len;
             if (expect > Integer.MAX_VALUE) {
                 return null;
             }
             return new ClimatePlan(batcher, g.batchDisp(), key, (int) expect,
                     cp.getMinBlockX(), QuartPos.toBlock(oyQuart), cp.getMinBlockZ(), 4, dimY, 4,
-                    g.batchRoots());
+                    g.batchRoots(), g.sourceRouter(), g.fused());
         } catch (Throwable th) {
             return null;
         }
+    }
+
+    /** Revalidates that a planned dispatcher still belongs to the registered router resource. */
+    public static boolean isCurrentBatchPlan(ClimatePlan plan) {
+        if (plan == null || plan.sourceRouter() == null || plan.disp() == null
+                || plan.targetFused() == null) {
+            return false;
+        }
+        try {
+            GpuDensityFunction temperature = gpuOf(plan.sourceRouter().temperature());
+            Group current = temperature == null ? null : REGISTRY.get(temperature);
+            return current != null && sameBatchTarget(current.sourceRouter(), current.batchDisp(),
+                    current.fused(), current.batchRoots(), plan.sourceRouter(), plan.disp(),
+                    plan.targetFused(), plan.chainRoots());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    static boolean sameBatchTarget(Object registeredRouter, Object registeredDispatcher,
+                                   Object registeredFused, Object registeredRoots,
+                                   Object expectedRouter, Object expectedDispatcher,
+                                   Object expectedFused, Object expectedRoots) {
+        return registeredRouter != null && registeredDispatcher != null && registeredFused != null
+                && registeredRoots != null && registeredRouter == expectedRouter
+                && registeredDispatcher == expectedDispatcher && registeredFused == expectedFused
+                && registeredRoots == expectedRoots;
+    }
+
+    private static boolean isCurrentGroup(Group expected) {
+        if (expected == null || expected.temp() == null || expected.sourceRouter() == null) {
+            return false;
+        }
+        return REGISTRY.get(expected.temp()) == expected;
     }
 
     // Float-parity gate sample lattice: a few chunk origins, quart stride, full overworld
@@ -938,6 +982,8 @@ public final class BiomeClimateCache {
     // ------------------------------------------------------------------
 
     private static final class Ctx {
+        GpuWorldgenPolicy.Permit permit;
+        GpuWorldgenPolicy.WorldScope worldScope;
         Object sampler;          // the armed Climate.Sampler identity (serve only for THIS sampler)
         Group group;
         // quart-lattice extent.
@@ -954,6 +1000,8 @@ public final class BiomeClimateCache {
         double[][] grids;        // [backedCount][gridLen] once completed
         boolean gridsFailed;     // dispatch/completion failed -> serve via CPU for this chunk
         boolean armed;
+        boolean gridsFromClimateStore;
+        boolean climateStoreResultUsed;
         // OPT#11: per-thread biome-serve counters, accumulated in serve() and flushed once
         // per chunk (in disarm) so the per-quart serve path never hits an AtomicLong under
         // 16-worker contention.
@@ -995,31 +1043,93 @@ public final class BiomeClimateCache {
     public static void beginChunk(ChunkAccess chunk, Climate.Sampler sampler, BiomeResolver resolver) {
         Ctx ctx = CTX.get();
         disarm(ctx);
-        if (!enabled || chunk == null || sampler == null || !OpenCLBackend.isAvailable()) {
+        GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_BEGIN_ENTERED);
+        if (!enabled) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_OFFLOAD_DISABLED);
             return;
+        }
+        if (chunk == null || sampler == null) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_OTHER_INELIGIBLE);
+            return;
+        }
+        if (!OpenCLBackend.isAvailable()) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_BACKEND_UNAVAILABLE);
+            return;
+        }
+        // createBiomes wraps its actual Supplier with the generator and RandomState passed to
+        // that task. Do not reconstruct a permit from ServerLevel here: that would fail to
+        // distinguish a DH/custom task whose sampler differs from the level's current state.
+        ctx.permit = GpuWorldgenPolicy.currentPermit();
+        if (ctx.permit == null) {
+            GpuAuthorizationDiagnostics.recordClimateAuthorizationFailure(
+                    GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                            chunk, sampler, null, GpuWorldgenPolicy.DispatchPath.CLIMATE));
+            disarm(ctx);
+            return;
+        }
+        if (!ctx.permit.matchesChunk(chunk)) {
+            GpuAuthorizationDiagnostics.recordClimateAuthorizationFailure(
+                    GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                            chunk, sampler, null, GpuWorldgenPolicy.DispatchPath.CLIMATE));
+            disarm(ctx);
+            return;
+        }
+        if (!ctx.permit.matchesSampler(sampler)) {
+            GpuAuthorizationDiagnostics.recordClimateAuthorizationFailure(
+                    GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                            chunk, sampler, null, GpuWorldgenPolicy.DispatchPath.CLIMATE));
+            disarm(ctx);
+            return;
+        }
+        if (!GpuWorldgenPolicy.isAuthorized(ctx.permit, GpuWorldgenPolicy.DispatchPath.CLIMATE)) {
+            GpuAuthorizationDiagnostics.recordClimateAuthorizationFailure(
+                    GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                            chunk, sampler, null, GpuWorldgenPolicy.DispatchPath.CLIMATE));
+            disarm(ctx);
+            return;
+        }
+        GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_BEGIN_AUTHORIZED);
+        ctx.worldScope = ctx.permit.worldScope();
+        if (!BATCH_CLIMATE) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.CLIMATE_BATCH_STORE_BYPASSED_CONFIG);
         }
         // Consumer check: a biome source that provably never calls Climate.Sampler.sample()
         // (The End's erosion-only resolver, fixed/checkerboard sources) would have its fused
         // climate grids computed, consumed/funneled and then discarded UNREAD every chunk —
         // pure GPU + drainer waste behind a green "offload ENABLED" boot line. Skip arming.
         if (resolver != null && neverSamplesClimate(resolver)) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.CLIMATE_RESOLVER_NEVER_SAMPLES);
             return;
         }
         GpuDensityFunction t = gpuOf(sampler.temperature());
         if (t == null) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_GROUP_UNAVAILABLE);
             return;
         }
         Group g = REGISTRY.get(t);
         if (g == null) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_GROUP_UNAVAILABLE);
+            return;
+        }
+        if (!isCurrentGroup(g)) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_GROUP_UNAVAILABLE);
+            return;
+        }
+        if (g.sourceRouter() != ctx.permit.routerIdentity() || !ctx.permit.matchesRouter(g.sourceRouter())) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_GROUP_MISMATCH);
             return;
         }
         // Defensive: the GPU-served members must be the SAME GPU functions the group fused
         // (a different sampler with a colliding temperature -> CPU fallback). NB the
         // Climate.Sampler record names router.vegetation() as humidity().
         if (g.veg() != null && gpuOf(sampler.humidity()) != g.veg()) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_SAMPLER_MISMATCH);
             return;
         }
         if (g.depth() != null && gpuOf(sampler.depth()) != g.depth()) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_SAMPLER_MISMATCH);
             return;
         }
         try {
@@ -1029,6 +1139,7 @@ public final class BiomeClimateCache {
             int maxSection = h.getMaxSection();
             int sections = maxSection - minSection;
             if (sections <= 0) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_OTHER_INELIGIBLE);
                 return;
             }
             ctx.oxQuart = QuartPos.fromBlock(cp.getMinBlockX());
@@ -1039,6 +1150,7 @@ public final class BiomeClimateCache {
             ctx.dimY = sections * 4;
             long len = (long) ctx.dimX * ctx.dimY * ctx.dimZ;
             if (len <= 0 || len > MAX_GRID_LEN) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_OTHER_INELIGIBLE);
                 return;
             }
             ctx.gridLen = (int) len;
@@ -1077,8 +1189,15 @@ public final class BiomeClimateCache {
                 if (!WORKER_DISPATCH) {
                     GpuChunkBatcher b = climateSubmitBatcher();
                     GpuBatchDispatcher bd = g.batchDisp();
-                    if (b != null && bd != null) {
-                        ctx.pendingBatch = b.submitTo(bd, ox, oy, oz, 4, 4, 4, ctx.dimX, ctx.dimY, ctx.dimZ);
+                    if (b != null && bd != null && isCurrentGroup(g)
+                            && GpuWorldgenPolicy.dispatchIfAuthorizedForRouter(ctx.permit,
+                            GpuWorldgenPolicy.DispatchPath.CLIMATE, g.sourceRouter(),
+                            () -> {
+                                if (isCurrentGroup(g)) {
+                                    ctx.pendingBatch = b.submitTo(ctx.worldScope, bd, ox, oy, oz,
+                                            4, 4, 4, ctx.dimX, ctx.dimY, ctx.dimZ);
+                                }
+                            }) && ctx.pendingBatch != null) {
                         return;
                     }
                     // No drainer / no gated program slot for this dimension: fall through to
@@ -1088,9 +1207,19 @@ public final class BiomeClimateCache {
             // EAGER ASYNC DISPATCH over the whole quart lattice (block coords) on the
             // WORKER thread — the pre-batching path. Reached only when batchClimate=false,
             // -Dsuperchunk.gpu.workerDispatch=true, or this dimension has no batched slot.
-            ctx.pending = g.fused().dispatchAsync(ox, oy, oz, 4, 4, 4, ctx.dimX, ctx.dimY, ctx.dimZ);
+            if (isCurrentGroup(g)) {
+                GpuWorldgenPolicy.dispatchIfAuthorizedForRouter(ctx.permit,
+                        GpuWorldgenPolicy.DispatchPath.CLIMATE, g.sourceRouter(),
+                        () -> {
+                            if (isCurrentGroup(g)) {
+                                ctx.pending = g.fused().dispatchAsync(ox, oy, oz,
+                                        4, 4, 4, ctx.dimX, ctx.dimY, ctx.dimZ);
+                            }
+                        });
+            }
             // pending may be null on dispatch failure -> ensureGrids() does a blocking fill.
         } catch (Throwable th) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_OTHER_INELIGIBLE);
             disarm(ctx);
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("[SuperChunk-GPU] [biome] beginChunk threw — CPU climate path for this chunk.", th);
@@ -1130,6 +1259,9 @@ public final class BiomeClimateCache {
     }
 
     private static void disarm(Ctx ctx) {
+        if (ctx.gridsFromClimateStore && !ctx.climateStoreResultUsed) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_COPIED_UNUSED);
+        }
         // OPT#11: flush this chunk's accumulated biome-serve counters in ONE batched update
         // before resetting ctx state. disarm runs at endChunk AND at the next beginChunk AND
         // on failure, so counts (which only accrue between begin/end on this thread) are
@@ -1175,10 +1307,14 @@ public final class BiomeClimateCache {
             }
         }
         ctx.armed = false;
+        ctx.permit = null;
+        ctx.worldScope = null;
         ctx.sampler = null;
         ctx.group = null;
         ctx.grids = null;
         ctx.gridsFailed = false;
+        ctx.gridsFromClimateStore = false;
+        ctx.climateStoreResultUsed = false;
     }
 
     // ------------------------------------------------------------------
@@ -1200,7 +1336,8 @@ public final class BiomeClimateCache {
             return null;
         }
         Ctx ctx = CTX.get();
-        if (!ctx.armed || ctx.sampler != sampler) {
+        if (!ctx.armed || ctx.sampler != sampler || ctx.permit == null
+                || !GpuWorldgenPolicy.isAuthorized(ctx.permit, GpuWorldgenPolicy.DispatchPath.CLIMATE)) {
             return null;
         }
         int ix = qx - ctx.oxQuart;
@@ -1225,6 +1362,10 @@ public final class BiomeClimateCache {
         out3[2] = g.rootDepth() >= 0 ? grids[g.rootDepth()][flat] : Double.NaN;
         ctx.biGpuSamples++;                    // OPT#11: per-thread; flushed once/chunk
         ctx.biGpuEvals += g.backedCount();
+        if (ctx.gridsFromClimateStore && !ctx.climateStoreResultUsed) {
+            ctx.climateStoreResultUsed = true;
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_USED);
+        }
         return out3;
     }
 
@@ -1289,14 +1430,23 @@ public final class BiomeClimateCache {
      */
     private static boolean consumeBatchedClimate(Ctx ctx, ChunkPos cp, Group g) {
         try {
-            GpuClimateStore.Key key = new GpuClimateStore.Key(cp.toLong(), ctx.oyQuart, ctx.dimY, g.fused());
+            GpuClimateStore.Key key = new GpuClimateStore.Key(ctx.worldScope,
+                    cp.toLong(), ctx.oyQuart, ctx.dimY, g.fused());
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_LOOKUP);
             GpuClimateStore.Stored st = GpuClimateStore.take(key);
-            if (st == null || st.fused != g.fused()) {
+            if (st == null) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_MISS);
+                return false;
+            }
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_HIT);
+            if (st.fused != g.fused()) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_INVALID_PAYLOAD);
                 return false;
             }
             int m = g.fused().rootCount();
             int len = ctx.gridLen;
             if (st.grids == null || st.grids.length != (long) m * len) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_INVALID_PAYLOAD);
                 return false;   // defensive; the prefetch validates length before put
             }
             double[][] out = ensureGridsBuf(ctx, m, len);
@@ -1304,9 +1454,13 @@ public final class BiomeClimateCache {
                 System.arraycopy(st.grids, k * len, out[k], 0, len);
             }
             ctx.grids = out;
+            ctx.gridsFromClimateStore = true;
+            ctx.climateStoreResultUsed = false;
             GpuFillStats.recordClimateBatchServe();
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_COPIED);
             return true;
         } catch (Throwable th) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.CLIMATE_STORE_EXCEPTION);
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("[SuperChunk-GPU] [biome-batch] consuming batched climate grid threw — per-chunk path.", th);
             }

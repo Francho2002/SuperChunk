@@ -253,8 +253,10 @@ public final class GpuDensityFunction implements AutoCloseable {
                                                    boolean fp32, AstNode ast) {
         CLProgram program = CLProgramCache.getOrBuild(source, fp32 ? "-DUSE_FP32" : "");
         if (program == null) {
-            LOGGER.warn("[SuperChunk-GPU] DF kernel build failed — CPU fallback.");
-            noteFailure("clBuildProgram failed (see build log above)");
+            String refusal = CLProgramCache.takeLastRefusal();
+            LOGGER.warn("[SuperChunk-GPU] DF kernel unavailable ({}) — CPU fallback.",
+                    refusal != null ? refusal : "build failed");
+            noteFailure(refusal != null ? refusal : "clBuildProgram failed (see build log above)");
             return null;
         }
         // Upload noise state (may be empty if the DF references no noises).
@@ -425,9 +427,13 @@ public final class GpuDensityFunction implements AutoCloseable {
         boolean recorded = false;
         try {
             program.enqueue1DAsync(rt.queue, kernel, CLProgram.roundUpGlobal(n), ev);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_OPENCL_ND_RANGE_ENQUEUED);
 
             long tReadStart = profile ? System.nanoTime() : 0L;
             rt.downloadReals(out, n);   // blocking — this is the single sync point
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_OPENCL_READBACK_COMPLETED);
             long tEnd = profile ? System.nanoTime() : 0L;
 
             if (profile) {
@@ -471,6 +477,8 @@ public final class GpuDensityFunction implements AutoCloseable {
         boolean recorded = false;
         try {
             program.enqueue1DAsync(rt.queue, kernel, CLProgram.roundUpGlobal(n), ev);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_OPENCL_ND_RANGE_ENQUEUED);
             if (legacy) {
                 // Faithful Phase-A baseline: explicit clFinish BEFORE the (also-blocking)
                 // readback, exactly as the original enqueue1D + readBuffer did.
@@ -479,6 +487,8 @@ public final class GpuDensityFunction implements AutoCloseable {
 
             long tReadStart = profile ? System.nanoTime() : 0L;
             rt.downloadReals(out, n);   // blocking — single sync point (or 2nd in legacy)
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_OPENCL_READBACK_COMPLETED);
             long tEnd = profile ? System.nanoTime() : 0L;
 
             if (profile) {

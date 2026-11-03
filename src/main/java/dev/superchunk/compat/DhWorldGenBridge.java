@@ -5,6 +5,7 @@ import dev.superchunk.gpu.dfc.ChunkGridCache;
 import dev.superchunk.gpu.dfc.GpuBatchPrefetch;
 import dev.superchunk.gpu.dfc.GpuClimatePrefetch;
 import dev.superchunk.gpu.dfc.GpuPrefetchHandle;
+import dev.superchunk.gpu.dfc.GpuWorldgenPolicy;
 import dev.superchunk.mixin.IChunkAccessLevelHeight;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -110,7 +111,8 @@ public final class DhWorldGenBridge {
      */
     public static void onGroup(ChunkStatus stepStatus, List<?> wrappers) {
         if (stepStatus == null || wrappers == null || wrappers.isEmpty()
-                || !DistantHorizonsCompat.applyBatchGeneratorHooks()) {
+                || !DistantHorizonsCompat.applyBatchGeneratorHooks()
+                || !GpuWorldgenPolicy.distantHorizonsBatchingEnabled()) {
             return;
         }
         try {
@@ -156,9 +158,19 @@ public final class DhWorldGenBridge {
         if (router == null) {
             return;
         }
+        GpuWorldgenPolicy.Permit scope = GpuWorldgenPolicy.forChunk(chunks.get(0), generator, level);
+        if (scope == null) {
+            return;
+        }
+        for (ChunkAccess chunk : chunks) {
+            GpuWorldgenPolicy.Permit member = GpuWorldgenPolicy.forChunk(chunk, generator, level);
+            if (!GpuWorldgenPolicy.sameExecutionScope(scope, member)) {
+                return; // Never batch a DH group across worlds, dimensions, generators or RandomStates.
+            }
+        }
         List<GpuPrefetchHandle> handles = new ArrayList<>(chunks.size());
         for (ChunkAccess chunk : chunks) {
-            GpuPrefetchHandle h = GpuClimatePrefetch.submitForChunk(chunk, generator, router);
+            GpuPrefetchHandle h = GpuClimatePrefetch.submitForChunk(chunk, generator, router, level);
             if (h != null) {
                 handles.add(h);
             }
@@ -184,9 +196,29 @@ public final class DhWorldGenBridge {
         if (chunks.isEmpty()) {
             return;
         }
+        ServerLevel level = levelOf(chunks.get(0));
+        if (level == null) {
+            return;
+        }
+        final ChunkGenerator generator;
+        try {
+            generator = level.getChunkSource().getGenerator();
+        } catch (Throwable t) {
+            return;
+        }
+        GpuWorldgenPolicy.Permit scope = GpuWorldgenPolicy.forChunk(chunks.get(0), generator, level);
+        if (scope == null) {
+            return;
+        }
+        for (ChunkAccess chunk : chunks) {
+            GpuWorldgenPolicy.Permit member = GpuWorldgenPolicy.forChunk(chunk, generator, level);
+            if (!GpuWorldgenPolicy.sameExecutionScope(scope, member)) {
+                return; // Never batch a DH group across worlds, dimensions, generators or RandomStates.
+            }
+        }
         List<GpuPrefetchHandle> handles = new ArrayList<>(chunks.size());
         for (ChunkAccess chunk : chunks) {
-            GpuPrefetchHandle h = GpuBatchPrefetch.submitForChunk(chunk);
+            GpuPrefetchHandle h = GpuBatchPrefetch.submitForChunk(chunk, generator, level);
             if (h != null) {
                 handles.add(h);
             }

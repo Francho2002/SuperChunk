@@ -376,13 +376,19 @@ tasks.named('test') { failOnNoDiscoveredTests = false }
 // Explicit, standalone diagnostic; never runs as part of build/check or game startup.
 tasks.register('standaloneGpuProbe', JavaExec) {
     group = 'verification'
-    description = 'Runs a bounded FP64 GPU batch diagnostic without launching Minecraft.'
+    description = 'Runs a bounded synthetic FP64 OpenCL calibration without launching Minecraft.'
     dependsOn tasks.named('classes')
     classpath = sourceSets.test.runtimeClasspath + configurations.lwjglServerBundle
     mainClass = 'dev.superchunk.gpu.StandaloneBatchProbe'
     systemProperty 'java.awt.headless', 'true'
-    timeout = java.time.Duration.ofSeconds(60)
+    timeout = java.time.Duration.ofMinutes(6)
     args '--run'
+    if (project.hasProperty('calibrationProfile')) {
+        args '--write-profile', project.property('calibrationProfile').toString()
+    }
+    if (project.hasProperty('calibrationTrials')) {
+        args '--write-trials', project.property('calibrationTrials').toString()
+    }
     def probeDir = layout.buildDirectory.dir('standalone-gpu-probe').get().asFile
     workingDir = probeDir
     doFirst { probeDir.mkdirs() }
@@ -403,7 +409,13 @@ tasks.register('standaloneGpuProbe', JavaExec) {
     skeinCompatRegressionTest: 'dev.superchunk.compat.SkeinCompatTest',
     mixinSquaredBridgeRegressionTest: 'dev.superchunk.compat.MixinSquaredBridgeTest',
     featureRegionReadsRegressionTest: 'dev.superchunk.worldgen.FeatureRegionReadsTest',
-    oreRunsRegressionTest: 'dev.superchunk.worldgen.OreRunsTest'
+    oreRunsRegressionTest: 'dev.superchunk.worldgen.OreRunsTest',
+    gpuWorldgenPolicyRegressionTest: 'dev.superchunk.gpu.dfc.GpuWorldgenPolicyRegressionTest',
+    calibrationProfileRegressionTest: 'dev.superchunk.gpu.calibration.CalibrationProfileRegressionTest',
+    gpuChunkBatcherLifecycleRegressionTest: 'dev.superchunk.gpu.dfc.GpuChunkBatcherLifecycleRegressionTest',
+    chunkGridCacheBatcherSelectionRegressionTest: 'dev.superchunk.gpu.dfc.ChunkGridCacheBatcherSelectionRegressionTest',
+    gpuAuthorizationDiagnosticsRegressionTest: 'dev.superchunk.gpu.dfc.GpuAuthorizationDiagnosticsRegressionTest',
+    worldgenMixinContractRegressionTest: 'dev.superchunk.WorldgenMixinContractTest'
 ].each { taskName, testMain ->
     def regression = tasks.register(taskName, JavaExec) {
         group = 'verification'
@@ -417,6 +429,33 @@ tasks.register('standaloneGpuProbe', JavaExec) {
         doFirst { runDir.mkdirs() }
     }
     tasks.named('check') { dependsOn regression }
+}
+
+tasks.register('projectExplosivePerfDiagnosticsRegressionTest', JavaExec) {
+    group = 'verification'
+    description = 'Runs deterministic JVM-only Project: Explosive diagnostics state-machine regressions.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnosticsRegressionTest'
+    def runDir = layout.buildDirectory.dir('regression-tests').get().asFile
+    workingDir = runDir
+    doFirst { runDir.mkdirs() }
+}
+tasks.named('check') { dependsOn tasks.named('projectExplosivePerfDiagnosticsRegressionTest') }
+
+tasks.register('projectExplosiveMixinContractVerification', JavaExec) {
+    group = 'verification'
+    description = 'Verifies PE 0.7.2-beta bytecode and FastChunk Mixin contracts against -PprojectExplosiveJar=<path>.'
+    dependsOn tasks.named('testClasses')
+    onlyIf { project.hasProperty('projectExplosiveJar') }
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.superchunk.diag.projectexplosive.ProjectExplosiveMixinContractTest'
+    if (project.hasProperty('projectExplosiveJar')) {
+        args project.property('projectExplosiveJar').toString()
+    }
+    def runDir = layout.buildDirectory.dir('regression-tests').get().asFile
+    workingDir = runDir
+    doFirst { runDir.mkdirs() }
 }
 
 // IDEA no longer automatically downloads sources/javadoc jars for dependencies, so we need to explicitly enable the behavior.

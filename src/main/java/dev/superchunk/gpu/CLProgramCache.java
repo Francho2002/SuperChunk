@@ -1,5 +1,6 @@
 package dev.superchunk.gpu;
 
+import dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics;
 import org.slf4j.Logger;
 
 import java.nio.file.Files;
@@ -86,6 +87,7 @@ public final class CLProgramCache {
             Long.getLong("superchunk.gpu.maxInlinedKernelMB", 500L) * 1_000_000L;
     /** Sources already refused (by cache key), so each is measured and reported once. */
     private static final java.util.Set<String> REFUSED = ConcurrentHashMap.newKeySet();
+    private static final ThreadLocal<String> LAST_REFUSAL = new ThreadLocal<>();
 
     private CLProgramCache() {
     }
@@ -96,6 +98,8 @@ public final class CLProgramCache {
             return false;
         }
         if (REFUSED.contains(key)) {
+            LAST_REFUSAL.set("kernel expansion guard: previously refused source");
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_REJECTED_EXPANSION);
             return true;
         }
         long inlined = KernelInlineEstimate.maxInlinedChars(source);
@@ -104,6 +108,8 @@ public final class CLProgramCache {
         }
         boolean first = REFUSED.isEmpty();
         REFUSED.add(key);
+        LAST_REFUSAL.set("kernel expansion guard: estimated inline source exceeds configured cap");
+        GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_REJECTED_EXPANSION);
         String message = "[SuperChunk-GPU] Not compiling an OpenCL program that inlines to {} MB (limit {} MB, "
                 + "-Dsuperchunk.gpu.maxInlinedKernelMB): the driver's compiler can need tens of GB of memory "
                 + "for it. The density functions it holds run on the CPU instead (same output).";
@@ -123,6 +129,7 @@ public final class CLProgramCache {
      * Returns {@code null} on build failure (caller falls back to CPU).
      */
     public static CLProgram getOrBuild(String source, String options) {
+        LAST_REFUSAL.remove();
         final long epoch = EPOCH.get();
         ensureDeviceTag();
         // Normalize to the EFFECTIVE build options (appends the device-gated
@@ -218,6 +225,13 @@ public final class CLProgramCache {
             }
             return program;
         }
+    }
+
+    /** Returns and clears a size-guard refusal from the current call, if one occurred. */
+    public static String takeLastRefusal() {
+        String reason = LAST_REFUSAL.get();
+        LAST_REFUSAL.remove();
+        return reason;
     }
 
     /**

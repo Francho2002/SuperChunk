@@ -58,6 +58,8 @@
     "MixinClimateRTreeLeaf",
     "MixinProbeBiomeLookup",
     "MixinNoiseChunkGeneratorCompactIds",
+    "MixinNoiseFillGpuAuthorization",
+    "MixinCreateBiomesGpuAuthorization",
     "MixinNoiseFillAirCells",
     "MixinNoiseChunkCellSign",
     "MixinSurfaceSystemCellBiome",
@@ -77,7 +79,12 @@
     "MixinWorldCarverContextReuse",
     "MixinWorldCarverEllipsoidScratch",
     "MixinWorldCarverLavaState",
-    "MixinWorldGenRegionInlineHeights"
+    "MixinWorldGenRegionInlineHeights",
+    "MixinServerLevelGpuScopeRetirement",
+    "MixinProjectExplosiveTerrainSweep",
+    "MixinProjectExplosiveTerrainChunkCache",
+    "MixinProjectExplosiveRadialDestruction",
+    "MixinProjectExplosiveRadialChunkCache"
   ],
   "client": [
     "client.MixinOptionsExtendRenderDistance",

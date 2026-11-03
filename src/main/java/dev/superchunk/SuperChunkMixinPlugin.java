@@ -48,6 +48,12 @@ public final class SuperChunkMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public void onLoad(String mixinPackage) {
+        if (Boolean.parseBoolean(System.getProperty(
+                dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.PROPERTY, "false"))) {
+            dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.reportBootstrap();
+        }
+        dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.MIXIN_CONFIG_LOADED);
         SuperChunkConfig.applyEarly();
         // One boot line, only when player.fullSpeedLoading=true, stating exactly which
         // server-side chunk-loading throttles are lifted this run.
@@ -69,6 +75,13 @@ public final class SuperChunkMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
+        // Project: Explosive is optional. These hooks are not loaded by default, and even when
+        // enabled they require the exact audited target class bytes from PE 0.7.2-beta.
+        if (mixinClassName.startsWith("dev.superchunk.mixin.MixinProjectExplosive")) {
+            return Boolean.parseBoolean(System.getProperty(
+                            dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.PROPERTY, "false"))
+                    && dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.targetMatches(targetClassName);
+        }
         // Load-time gates for mixins whose optimisation lives in soft-overridden methods
         // (no runtime flag possible). Each defaults ON; the -D kill-switch exists for
         // regression bisection.
@@ -112,13 +125,31 @@ public final class SuperChunkMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
+        recordGpuAuthorizationMixinLifecycle(mixinClassName, false);
     }
 
     @Override
     public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
+        recordGpuAuthorizationMixinLifecycle(mixinClassName, true);
         // The probe has the highest priority, so every other mod's mixins are already merged.
         if (mixinClassName.endsWith(".MixinProbeBiomeLookup")) {
             MixinTargetScan.record(targetClassName, targetClass);
         }
+    }
+
+    private static void recordGpuAuthorizationMixinLifecycle(String mixinClassName, boolean applied) {
+        String suffix;
+        if (mixinClassName.endsWith(".MixinCreateBiomesGpuAuthorization")) {
+            suffix = "CREATE_BIOMES_MIXIN_";
+        } else if (mixinClassName.endsWith(".MixinNoiseFillGpuAuthorization")) {
+            suffix = "NOISE_FILL_MIXIN_";
+        } else if (mixinClassName.endsWith(".MixinNoiseChunkGeneratorCompactIds")) {
+            suffix = "COMPACT_IDS_MIXIN_";
+        } else {
+            return;
+        }
+        dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.valueOf(
+                        suffix + (applied ? "POST_APPLY" : "PRE_APPLY")));
     }
 }

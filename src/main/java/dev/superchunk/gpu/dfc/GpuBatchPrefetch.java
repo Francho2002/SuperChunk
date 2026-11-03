@@ -6,6 +6,8 @@ import dev.superchunk.gpu.OpenCLBackend;
 import io.reactivex.rxjava3.core.Completable;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.levelgen.NoiseChunk;
 import org.slf4j.Logger;
 
@@ -101,7 +103,42 @@ public final class GpuBatchPrefetch {
      * the chunk takes the per-chunk {@link ChunkGridCache} path. Never throws.
      */
     public static GpuPrefetchHandle submitForChunk(ChunkAccess chunk) {
+        return submitForChunk(chunk, null, null);
+    }
+
+    /** Explicit DH/group variant: requires the actual chunk's level and generator to match. */
+    public static GpuPrefetchHandle submitForChunk(ChunkAccess chunk,
+                                                   ChunkGenerator expectedGenerator,
+                                                   ServerLevel expectedLevel) {
         try {
+            // This overload is the DH group seam. DH currently does not expose the generator and
+            // RandomState actually used for its task, so a ServerLevel-derived identity is not
+            // sufficient evidence for group batching. Keep the original per-chunk path available.
+            if ((expectedGenerator != null || expectedLevel != null)
+                    && !GpuWorldgenPolicy.distantHorizonsBatchingEnabled()) {
+                return null;
+            }
+            final GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.forChunk(chunk, expectedGenerator, expectedLevel);
+            final GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket = permit == null
+                    ? GpuWorldgenPolicy.diagnosticBucketForChunk(chunk)
+                    : permit.worldScope().diagnosticBucket();
+            GpuWorldgenPolicy.AuthorizationDiagnostic authorization = permit == null
+                    ? GpuWorldgenPolicy.diagnoseChunkInputsForDiagnostics(chunk, expectedGenerator, expectedLevel)
+                    : GpuWorldgenPolicy.diagnosePermitForDiagnostics(permit, chunk, null,
+                            GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH);
+            if (authorization != GpuWorldgenPolicy.AuthorizationDiagnostic.AUTHORIZED) {
+                if (GpuAuthorizationDiagnostics.enabled()) {
+                    GpuAuthorizationDiagnostics.recordDensityAuthorizationFailure(
+                            authorization, diagnosticBucket);
+                }
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_AUTHORIZATION_REJECTED,
+                        diagnosticBucket);
+                GpuFillStats.recordBatchPrefetchSkipped();
+                return null;
+            }
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_CONTEXT_CAPTURED, diagnosticBucket);
             GpuChunkBatcher batcher = ChunkGridCache.liveBatcher();
             GpuFusedInterpolator fused = ChunkGridCache.batcherFused();
             if (batcher == null || fused == null || chunk == null) {
@@ -127,6 +164,11 @@ public final class GpuBatchPrefetch {
                 GpuFillStats.recordBatchPrefetchSkipped();
                 return null;
             }
+            final GpuWorldgenPolicy.WorldScope batcherTargetScope = ChunkGridCache.batcherWorldScope();
+            if (batcherTargetScope == null || batcherTargetScope != permit.worldScope()) {
+                GpuFillStats.recordBatchCrossDimSkip();
+                return null;
+            }
             // CROSS-DIMENSION GUARD (2026-07-02): only submit chunks whose lattice geometry
             // belongs to the batcher's fused group. The batcher is compiled over ONE
             // dimension's group; submitting another dimension's chunk would run the WRONG
@@ -134,7 +176,7 @@ public final class GpuBatchPrefetch {
             // dimension's fill never queries, and count the waste as a batch-serve WIN.
             // Skipped chunks ride the per-chunk path (their own group's eager/blocking fill).
             if (!ChunkGridCache.geometryMatchesBatcher(ext.oy, ext.sx, ext.sy, ext.sz,
-                    ext.dimX, ext.dimY, ext.dimZ)) {
+                    ext.dimX, ext.dimY, ext.dimZ, batcherTargetScope)) {
                 GpuFillStats.recordBatchCrossDimSkip();
                 return null;
             }
@@ -147,7 +189,7 @@ public final class GpuBatchPrefetch {
             // geometry, so a concurrently-generating other dimension at the same (x,z) can never
             // alias this entry. Derived from the SAME extent the consume side derives, so the
             // fill finds exactly this deposit.
-            final GpuBatchStore.Key key = GpuBatchStore.key(pos,
+            final GpuBatchStore.Key key = GpuBatchStore.key(pos, permit.worldScope(),
                     ext.ox, ext.oy, ext.oz, ext.sx, ext.sy, ext.sz, ext.dimX, ext.dimY, ext.dimZ);
             // Already prefetched for this chunk (a re-upgrade, or the BIOMES-seam
             // climate-chain combined submit already carried this chunk's density
@@ -162,13 +204,19 @@ public final class GpuBatchPrefetch {
             // exists — the 315-cell FluidStatus snapshot + beard AABB + vein seed route.
             // null (any capture failure / flag off) = the chunk rides corner-only.
             final CompactIds.ChunkAux aux = CompactIds.PROBE ? CompactIds.captureAux(nc) : null;
-            final GpuChunkBatcher.SubmitHandle handle;
+            final GpuChunkBatcher.SubmitHandle[] handleHolder = new GpuChunkBatcher.SubmitHandle[1];
             CompletableFuture<double[]> future;
             try {
-                handle = batcher.submitCompact(
-                        ext.ox, ext.oy, ext.oz,
-                        ext.sx, ext.sy, ext.sz,
-                        ext.dimX, ext.dimY, ext.dimZ, aux);
+                if (!GpuWorldgenPolicy.dispatchIfAuthorizedInScope(permit,
+                        GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH, batcherTargetScope,
+                        () -> handleHolder[0] = batcher.submitCompact(
+                                ext.ox, ext.oy, ext.oz,
+                                ext.sx, ext.sy, ext.sz,
+                                ext.dimX, ext.dimY, ext.dimZ, aux))) {
+                    GpuFillStats.recordBatchPrefetchSkipped();
+                    return null;
+                }
+                final GpuChunkBatcher.SubmitHandle handle = handleHolder[0];
                 future = handle == null ? null : handle.future();
             } catch (Throwable t) {
                 GpuFillStats.recordBatchPrefetchSkipped();
@@ -178,6 +226,8 @@ public final class GpuBatchPrefetch {
                 GpuFillStats.recordBatchPrefetchSkipped();
                 return null;
             }
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_SUBMITTED, diagnosticBucket);
 
             final GpuFusedInterpolator ffused = fused;
             // Tracks whether the future resolved (so the entry was stored for the fill).
@@ -200,7 +250,17 @@ public final class GpuBatchPrefetch {
                     // anyway, ChunkGridCache.consumeBatchedGrid rejects it on its existing
                     // length check and takes the per-chunk path.
                     final boolean deadGrids = GpuChunkBatcher.isDeadGrids(grids);
-                    if (err == null && grids != null && (grids.length == expectLen || deadGrids)) {
+                    boolean validResult = err == null && grids != null
+                            && (grids.length == expectLen || deadGrids);
+                    boolean validContext = validResult
+                            && GpuWorldgenPolicy.isAuthorizedInScope(permit,
+                            GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH, batcherTargetScope)
+                            && GpuWorldgenPolicy.sameDepositScope(permit, key.worldScope())
+                            && key.worldScope() == permit.worldScope();
+                    if (validContext) {
+                        GpuAuthorizationDiagnostics.record(
+                                GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_CONTEXT_REVALIDATED,
+                                diagnosticBucket);
                         // ON-DEVICE INTERP PREFETCH POOL: produce the two full fields NOW (on
                         // THIS — the batcher — thread, off the worker's fill critical path) into
                         // a REUSED pooled holder, so the fill serves them READY with no GPU
@@ -236,14 +296,21 @@ public final class GpuBatchPrefetch {
                         // COMPACT-IDS: the chunk's 1-byte/block ids ride the store next to
                         // the grids (PROBE: the consumer ignores them — counters prove
                         // arrival). Written drainer-side before the future completed.
-                        byte[] ids = CompactIds.PROBE && handle != null ? handle.ids() : null;
-                        GpuBatchStore.put(key, new GpuBatchStore.Stored(ffused, ext, grids, holder, ids,
-                                aux != null ? aux.route : null));
+                        byte[] ids = CompactIds.PROBE && handleHolder[0] != null
+                                ? handleHolder[0].ids() : null;
+                        GpuBatchStore.put(key, new GpuBatchStore.Stored(permit.worldScope(), ffused, ext,
+                                grids, holder, ids, aux != null ? aux.route : null));
+                        GpuAuthorizationDiagnostics.record(
+                                GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_STORE_PUT, diagnosticBucket);
                         if (CompactIds.PROBE) {
                             CompactIds.recordDeposit(ids);
                         }
                         GpuFillStats.recordBatchPrefetch();
                     } else {
+                        GpuAuthorizationDiagnostics.record(validResult
+                                ? GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_CONTEXT_REJECTED
+                                : GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_RESULT_REJECTED,
+                                diagnosticBucket);
                         // On any failure/timeout/cancel/short-grids we DON'T store: the
                         // fill transparently falls back to the per-chunk dispatch path.
                         // Count it — a silently-dying pipeline must show as failures,
@@ -251,6 +318,9 @@ public final class GpuBatchPrefetch {
                         GpuFillStats.recordBatchPrefetchFailed();
                     }
                 } catch (Throwable ignored) {
+                    GpuAuthorizationDiagnostics.record(
+                            GpuAuthorizationDiagnostics.Event.DENSITY_PREFETCH_RESULT_REJECTED,
+                            diagnosticBucket);
                     // never propagate
                 }
                 // ALWAYS complete — never error into the scheduler, never hang.

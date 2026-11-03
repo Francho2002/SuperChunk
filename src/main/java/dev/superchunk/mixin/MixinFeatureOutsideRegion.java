@@ -3,6 +3,7 @@ package dev.superchunk.mixin;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import dev.superchunk.worldgen.FeatureRegionReads;
+import dev.superchunk.gpu.dfc.GpuWorldgenPolicy;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.WorldGenLevel;
@@ -25,7 +26,8 @@ public abstract class MixinFeatureOutsideRegion {
             require = 0)
     private boolean superchunk$skipOutsideRegion(PlacedFeature feature, WorldGenLevel level, ChunkGenerator generator,
                                                  RandomSource random, BlockPos origin, Operation<Boolean> original) {
-        if (!FeatureRegionReads.SKIP_ENABLED) {
+        if (!FeatureRegionReads.SKIP_ENABLED
+                || GpuWorldgenPolicy.classify(generator) != GpuWorldgenPolicy.GeneratorKind.VANILLA_NOISE) {
             return original.call(feature, level, generator, random, origin);
         }
         try {

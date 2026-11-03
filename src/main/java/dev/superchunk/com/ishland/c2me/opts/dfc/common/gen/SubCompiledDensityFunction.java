@@ -164,7 +164,9 @@ public class SubCompiledDensityFunction implements DensityFunction {
             boolean gpuDone = false;
             if (gpu != null) {
                 long t0 = System.nanoTime();
-                gpuDone = gpu.fill(densities, vx, vy, vz);
+                dev.superchunk.gpu.dfc.GpuWorldgenPolicy.Permit permit =
+                        currentTaskPermitForDensity(applier);
+                gpuDone = gpu.fill(densities, vx, vy, vz, permit);
                 long attemptNanos = System.nanoTime() - t0;
                 // Record the GPU attempt wall-time regardless of outcome so
                 // gpuFillNanos+cpuFillNanos stays a true 100% of fill time. On a fall-back
@@ -178,12 +180,21 @@ public class SubCompiledDensityFunction implements DensityFunction {
                 } else {
                     dev.superchunk.gpu.dfc.GpuFillStats.recordCpuTime(attemptNanos);
                 }
+            } else if (dev.superchunk.gpu.dfc.GpuDfcHook.isRoutingEnabled()) {
+                dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                        dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_ABSENT);
+                dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                        dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_COMPILE_FALLBACK);
             }
             if (!gpuDone) {
                 // gpu==null => this DF never GPU-compiled (e.g. CacheLikeNode); count it
                 // as a CPU batch + time it, but ONLY when GPU routing is on (no overhead
                 // on the pure-CPU production default).
                 boolean routing = gpu != null || dev.superchunk.gpu.dfc.GpuDfcHook.isRoutingEnabled();
+                if (routing) {
+                    dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                            dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_CPU_FALLBACK);
+                }
                 if (gpu == null && routing) {
                     dev.superchunk.gpu.dfc.GpuFillStats.recordCpu(densities.length);
                 }
@@ -214,7 +225,9 @@ public class SubCompiledDensityFunction implements DensityFunction {
         boolean gpuDone = false;
         if (gpu != null) {
             long t0 = System.nanoTime();
-            gpuDone = gpu.fill(densities, x, y, z);
+            dev.superchunk.gpu.dfc.GpuWorldgenPolicy.Permit permit =
+                    currentTaskPermitForDensity(applier);
+            gpuDone = gpu.fill(densities, x, y, z, permit);
             long attemptNanos = System.nanoTime() - t0;
             // Record the GPU attempt wall-time regardless of outcome so
             // gpuFillNanos+cpuFillNanos stays a true 100% of fill time. On a fall-back
@@ -228,9 +241,18 @@ public class SubCompiledDensityFunction implements DensityFunction {
             } else {
                 dev.superchunk.gpu.dfc.GpuFillStats.recordCpuTime(attemptNanos);
             }
+        } else if (dev.superchunk.gpu.dfc.GpuDfcHook.isRoutingEnabled()) {
+            dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                    dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_ABSENT);
+            dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                    dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_COMPILE_FALLBACK);
         }
         if (!gpuDone) {
             boolean routing = gpu != null || dev.superchunk.gpu.dfc.GpuDfcHook.isRoutingEnabled();
+            if (routing) {
+                dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.record(
+                        dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics.Event.DENSITY_CPU_FALLBACK);
+            }
             if (gpu == null && routing) {
                 dev.superchunk.gpu.dfc.GpuFillStats.recordCpu(densities.length);
             }
@@ -248,6 +270,24 @@ public class SubCompiledDensityFunction implements DensityFunction {
             cache.recycle(y);
             cache.recycle(z);
         }
+    }
+
+    /**
+     * C2ME's {@link EachApplierVanillaInterface} is the coordinate-array adapter that
+     * {@code DelegateNode.evalMulti} passes back into this fill method. It is not a
+     * {@link NoiseChunk}, so testing only for NoiseChunk silently discarded the active
+     * doFill task permit on the normal compiled-array route. Both accepted applier types
+     * are evaluated synchronously inside the scoped noise fill; currentPermit revalidates
+     * the exact world, generator, RandomState, chunk and revocable scope. Every other
+     * context still falls back to CPU.
+     */
+    static dev.superchunk.gpu.dfc.GpuWorldgenPolicy.Permit currentTaskPermitForDensity(
+            DensityFunction.ContextProvider applier) {
+        if (!(applier instanceof EachApplierVanillaInterface)
+                && !(applier instanceof NoiseChunk)) {
+            return null;
+        }
+        return dev.superchunk.gpu.dfc.GpuWorldgenPolicy.currentPermit();
     }
 
     @Override

@@ -453,6 +453,7 @@ public final class GpuFillStats {
         long totB = gB + cB;
         long totV = gV + cV;
         if (totB == 0L) {
+            GpuAuthorizationDiagnostics.logSummary(when);
             return;
         }
         double batchPct = 100.0 * gB / totB;
@@ -543,9 +544,10 @@ public final class GpuFillStats {
             double hitPct = cTot == 0L ? 0.0 : 100.0 * cS / cTot;
             LOGGER.info("[SuperChunk-GPU] [biome-batch] cross-chunk climate consumer ({}): chunks prefetched into batched "
                             + "dispatches={}, served from the climate store (no per-chunk dispatch)={} ({}% of armed fills), "
-                            + "misses funneled per-chunk={} (store: puts={}, consumed={}, residual={}, evicted={}).",
+                            + "misses funneled per-chunk={} (store: puts={}, taken={}, residual={}, removed={}, evicted={}).",
                     when, cP, cS, String.format("%.1f", hitPct), cM,
-                    GpuClimateStore.puts(), GpuClimateStore.takes(), GpuClimateStore.size(), GpuClimateStore.evictions());
+                    GpuClimateStore.puts(), GpuClimateStore.takes(), GpuClimateStore.size(),
+                    GpuClimateStore.removals(), GpuClimateStore.evictions());
             // The climate batcher's own view: pooled requests, dispatches, batch sizes.
             try {
                 GpuChunkBatcher climateBatcher = BiomeClimateCache.climateBatcher();
@@ -627,6 +629,7 @@ public final class GpuFillStats {
                             + "— honest 'who did the work' metric (value-count above is misleading: CPU side is mostly cheap lerp-cache fills).",
                     when, gNs / 1_000_000L, String.format("%.1f", timePct), cNs / 1_000_000L);
         }
+        GpuAuthorizationDiagnostics.logSummary(when);
     }
 
 }

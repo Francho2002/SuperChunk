@@ -8,11 +8,17 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * SuperChunk GPU — thread-safe cross-chunk <b>AGGREGATOR</b> (producer/consumer).
@@ -45,9 +51,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * registrants, NOT by {@link #shutdown()}.
  *
  * <p><b>Grouping + flush policy.</b> Requests are grouped by their geometry key
- * {@code (target,strx,stry,strz,dimX,dimY,dimZ)} — only same-target, same-geometry
- * requests can share one batch (all overworld chunks share one geometry, so in
- * practice there is one group per program slot).
+     * {@code (target,worldScope,strx,stry,strz,dimX,dimY,dimZ)} — only same-target,
+     * same-scope, same-geometry requests can share one batch (all chunks in one world
+     * share one geometry, so in practice there is one group per program slot and scope).
  * A group is flushed when it reaches {@code batchLimit} pending requests OR
  * {@code batchWindowMicros} have elapsed since its oldest pending request — whichever
  * comes first. On flush, up to {@code batchLimit} chunks' origins are packed into an
@@ -103,11 +109,19 @@ public final class GpuChunkBatcher implements AutoCloseable {
     private static final int MAX_QUEUE = 1 << 16;
     /** Idle park when no group is pending; a submit wakes the drainer immediately anyway. */
     private static final long IDLE_PARK_NANOS = 10_000_000L; // 10 ms
-    /** Max time {@link #shutdown()} waits for the drainer to finish + flush. */
-    private static final long SHUTDOWN_JOIN_MILLIS = 5_000L;
-
     /** Live-path singleton for the next stage (and the {@link OpenCLBackend#shutdown()} hook). */
     private static volatile GpuChunkBatcher SHARED;
+    /** Once backend teardown starts, callbacks may not install a replacement singleton. */
+    private static final AtomicBoolean BACKEND_SHUTDOWN = new AtomicBoolean();
+    private static final Object SHARED_LIFECYCLE_LOCK = new Object();
+    /** Every batcher lifecycle shutdown/retirement in progress; backend snapshots under the same lock. */
+    private static final java.util.Set<GpuChunkBatcher> ACTIVE_LIFECYCLES = ConcurrentHashMap.newKeySet();
+    /** Every started batcher, including dedicated climate instances, participates in backend teardown. */
+    private static final java.util.Set<GpuChunkBatcher> LIVE_BATCHERS = ConcurrentHashMap.newKeySet();
+    /** Failed close is terminal; retain its owner and native handles without retrying close(). */
+    private static final java.util.Set<GpuChunkBatcher> FAILED_CLOSE_BATCHERS = ConcurrentHashMap.newKeySet();
+    /** A failed native-dispatcher close permanently vetoes further batcher/backend teardown. */
+    private static final AtomicBoolean DISPATCHER_CLOSE_FAILED = new AtomicBoolean();
 
     /**
      * The PRIMARY program slot ({@link #submit}/{@link #submitCompact} target), or
@@ -116,6 +130,13 @@ public final class GpuChunkBatcher implements AutoCloseable {
      * batcher: closed in {@link #shutdown()} when present.
      */
     private final GpuBatchDispatcher dispatcher;
+    /** Close action is injectable only for the standalone lifecycle regression fixture. */
+    private final Runnable primaryDispatcherCloser;
+    /** Null in production; test-only gates let the lifecycle fixture hold queued work deterministically. */
+    private final Runnable beforeDrainLoopForTest;
+    private final Runnable beforeBatchDispatchForTest;
+    /** Scope whose fused ASTs the primary dispatcher was compiled for; null for synthetic/unscoped instances. */
+    private final GpuWorldgenPolicy.WorldScope ownerWorldScope;
     private final int batchLimit;         // max chunks coalesced into one dispatch
     private final long batchWindowNanos;  // max time a request waits before its group flushes
 
@@ -127,6 +148,16 @@ public final class GpuChunkBatcher implements AutoCloseable {
     // Effectively bounded by the dispatcher slot ring (enqueueBatch blocks on slots).
     private final LinkedBlockingQueue<PendingBatch> completionQueue = new LinkedBlockingQueue<>();
     private final Thread completer;
+    /** Serializes the last retirement check with dispatcher enqueue. */
+    private final Object dispatchBoundary = new Object();
+    private final Object lifecycleBoundary = new Object();
+    private final AtomicBoolean ownerRetirementRequested = new AtomicBoolean();
+    private final AtomicBoolean retirementOnDrainer = new AtomicBoolean();
+    private final CountDownLatch retirementModeChosen = new CountDownLatch(1);
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
+    private final AtomicBoolean primaryDispatcherCloseAttempted = new AtomicBoolean();
+    private volatile boolean primaryDispatcherCloseSucceeded;
+    private final CompletableFuture<RetirementResult> lifecycleCompletion = new CompletableFuture<>();
     /** Sentinel pushed after the drainer joined; the completer drains then exits. */
     private static final PendingBatch POISON = new PendingBatch(null, null, 0, 0, false);
 
@@ -177,8 +208,28 @@ public final class GpuChunkBatcher implements AutoCloseable {
             new AtomicLong(), new AtomicLong(), new AtomicLong(), new AtomicLong()};
 
     private GpuChunkBatcher(GpuBatchDispatcher dispatcher, int batchLimit, long batchWindowMicros,
-                            String threadName) {
+                            String threadName, GpuWorldgenPolicy.WorldScope ownerWorldScope) {
+        this(dispatcher, dispatcher == null ? null : dispatcher::close, batchLimit,
+                batchWindowMicros, threadName, ownerWorldScope);
+    }
+
+    private GpuChunkBatcher(GpuBatchDispatcher dispatcher, Runnable primaryDispatcherCloser,
+                            int batchLimit, long batchWindowMicros,
+                            String threadName, GpuWorldgenPolicy.WorldScope ownerWorldScope) {
+        this(dispatcher, primaryDispatcherCloser, batchLimit, batchWindowMicros,
+                threadName, ownerWorldScope, null, null);
+    }
+
+    private GpuChunkBatcher(GpuBatchDispatcher dispatcher, Runnable primaryDispatcherCloser,
+                            int batchLimit, long batchWindowMicros,
+                            String threadName, GpuWorldgenPolicy.WorldScope ownerWorldScope,
+                            Runnable beforeDrainLoopForTest, Runnable beforeBatchDispatchForTest) {
         this.dispatcher = dispatcher;
+        this.primaryDispatcherCloser = primaryDispatcherCloser;
+        this.beforeDrainLoopForTest = beforeDrainLoopForTest;
+        this.beforeBatchDispatchForTest = beforeBatchDispatchForTest;
+        this.ownerWorldScope = ownerWorldScope;
+        this.primaryDispatcherCloseSucceeded = primaryDispatcherCloser == null;
         this.batchLimit = Math.max(1, batchLimit);
         this.batchWindowNanos = Math.max(0L, batchWindowMicros) * 1_000L;
         this.liveScratch = new Req[this.batchLimit];
@@ -186,13 +237,38 @@ public final class GpuChunkBatcher implements AutoCloseable {
         this.drainer.setDaemon(true);
         this.completer = new Thread(this::completeLoop, threadName + "-completer");
         this.completer.setDaemon(true);
-        this.completer.start();
-        this.drainer.start();
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            if (BACKEND_SHUTDOWN.get()) {
+                throw new IllegalStateException("OpenCL batcher backend is already shutting down");
+            }
+            // Register before starting either thread while holding the same barrier used
+            // by shutdownBackend's live-owner snapshot.
+            LIVE_BATCHERS.add(this);
+            this.completer.start();
+            this.drainer.start();
+        }
     }
 
     // ----------------------------------------------------------------------
     // Lifecycle (static singleton for the live path + the backend shutdown hook).
     // ----------------------------------------------------------------------
+
+    public enum RetirementDisposition {
+        STARTED,
+        ALREADY_RETIRING,
+        SHUTDOWN_ALREADY_STARTED,
+        ALREADY_COMPLETE,
+        BACKEND_TERMINAL
+    }
+
+    public enum RetirementResult {
+        QUIESCENT,
+        CLOSE_FAILED
+    }
+
+    /** Idempotent retirement request plus the one lifecycle result shared by all callers. */
+    public record RetirementRequest(RetirementDisposition disposition,
+                                    CompletionStage<RetirementResult> completion) { }
 
     /**
      * Creates the shared batcher over {@code dispatcher}, reading {@code batchLimit} /
@@ -200,18 +276,55 @@ public final class GpuChunkBatcher implements AutoCloseable {
      * existing shared batcher (shutting it down first). Returns the new instance.
      */
     public static GpuChunkBatcher init(GpuBatchDispatcher dispatcher) {
-        return init(dispatcher, configBatchLimit(), configWindowMicros());
+        return init(dispatcher, configBatchLimit(), configWindowMicros(), null);
     }
 
     /** Creates the shared batcher with explicit knobs. Replaces any existing one. */
     public static GpuChunkBatcher init(GpuBatchDispatcher dispatcher, int batchLimit, long batchWindowMicros) {
+        return init(dispatcher, batchLimit, batchWindowMicros, null);
+    }
+
+    /** Creates a world-owned shared batcher whose every primary request carries this scope. */
+    public static GpuChunkBatcher init(GpuBatchDispatcher dispatcher,
+                                       GpuWorldgenPolicy.WorldScope ownerWorldScope) {
+        return init(dispatcher, configBatchLimit(), configWindowMicros(), ownerWorldScope);
+    }
+
+    private static GpuChunkBatcher init(GpuBatchDispatcher dispatcher, int batchLimit,
+                                        long batchWindowMicros,
+                                        GpuWorldgenPolicy.WorldScope ownerWorldScope) {
         if (dispatcher == null) {
             return null;
         }
+        return initSharedBatcher(() -> new GpuChunkBatcher(dispatcher, batchLimit,
+                batchWindowMicros, "SuperChunk-GPU-batcher", ownerWorldScope));
+    }
+
+    /** Shared creation/replacement loop used by production init and the local lifecycle fixture. */
+    private static GpuChunkBatcher initSharedBatcher(Supplier<GpuChunkBatcher> factory) {
         shutdownShared();
-        GpuChunkBatcher b = new GpuChunkBatcher(dispatcher, batchLimit, batchWindowMicros, "SuperChunk-GPU-batcher");
-        SHARED = b;
-        return b;
+        while (true) {
+            java.util.List<GpuChunkBatcher> pending;
+            synchronized (SHARED_LIFECYCLE_LOCK) {
+                if (BACKEND_SHUTDOWN.get() || DISPATCHER_CLOSE_FAILED.get()) return null;
+                if (SHARED != null) return null;
+                if (ACTIVE_LIFECYCLES.isEmpty()) {
+                    return installSharedBatcherLocked(factory);
+                }
+                pending = java.util.List.copyOf(ACTIVE_LIFECYCLES);
+            }
+            // Never hold the singleton lock while waiting for accepted CL work or callbacks.
+            for (GpuChunkBatcher batcher : pending) batcher.awaitLifecycleCompletion();
+        }
+    }
+
+    /** Caller holds SHARED_LIFECYCLE_LOCK; this is the single atomic shared-slot install gate. */
+    private static GpuChunkBatcher installSharedBatcherLocked(Supplier<GpuChunkBatcher> factory) {
+        if (BACKEND_SHUTDOWN.get() || DISPATCHER_CLOSE_FAILED.get()
+                || SHARED != null || !ACTIVE_LIFECYCLES.isEmpty()) return null;
+        GpuChunkBatcher batcher = factory.get();
+        if (batcher != null) SHARED = batcher;
+        return batcher;
     }
 
     /**
@@ -223,8 +336,66 @@ public final class GpuChunkBatcher implements AutoCloseable {
      * ({@code BiomeClimateCache}), whose lifecycle (RandomState build) is independent of
      * the density batcher's ({@code batchChunks} + fused-group discovery).
      */
+    /** Returns null after backend teardown begins; no worker is started in that case. */
     public static GpuChunkBatcher createDedicated(String threadName) {
-        return new GpuChunkBatcher(null, configBatchLimit(), configWindowMicros(), threadName);
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            if (BACKEND_SHUTDOWN.get()) return null;
+            return new GpuChunkBatcher(null, configBatchLimit(), configWindowMicros(), threadName, null);
+        }
+    }
+
+    /** Creates a real worker pair with a fake close action for the non-Minecraft lifecycle fixture. */
+    static GpuChunkBatcher createLifecycleTestBatcher(Runnable closeAction) {
+        return createLifecycleTestBatcher(closeAction, null, null);
+    }
+
+    static GpuChunkBatcher createLifecycleTestBatcher(Runnable closeAction,
+                                                      Runnable beforeDrainLoop,
+                                                      Runnable beforeBatchDispatch) {
+        if (closeAction == null) throw new IllegalArgumentException("closeAction must not be null");
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            if (BACKEND_SHUTDOWN.get()) throw new IllegalStateException("backend is terminal in fixture JVM");
+            return new GpuChunkBatcher(null, closeAction, 1, 0L,
+                    "SuperChunk-GPU-batcher-lifecycle-fixture", null,
+                    beforeDrainLoop, beforeBatchDispatch);
+        }
+    }
+
+    static GpuChunkBatcher installLifecycleTestSharedBatcher(Runnable closeAction,
+                                                             AtomicLong creations) {
+        if (closeAction == null || creations == null) throw new IllegalArgumentException("test hooks are required");
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            return installSharedBatcherLocked(() -> {
+                creations.incrementAndGet();
+                return new GpuChunkBatcher(null, closeAction, 1, 0L,
+                        "SuperChunk-GPU-batcher-lifecycle-fixture-shared", null);
+            });
+        }
+    }
+
+    static GpuChunkBatcher initLifecycleTestSharedBatcher(Runnable closeAction,
+                                                          AtomicLong creations) {
+        if (closeAction == null || creations == null) throw new IllegalArgumentException("test hooks are required");
+        return initSharedBatcher(() -> {
+            creations.incrementAndGet();
+            return new GpuChunkBatcher(null, closeAction, 1, 0L,
+                    "SuperChunk-GPU-batcher-lifecycle-fixture-replacement", null);
+        });
+    }
+
+    CompletableFuture<double[]> enqueueSyntheticForLifecycleTest() {
+        CompletableFuture<double[]> future = new CompletableFuture<>();
+        GeometryKey key = new GeometryKey(null, null, 1, 1, 1, 1, 1, 1);
+        enqueueReq(new Req(0, 0, 0, key, future, null), future);
+        return future;
+    }
+
+    boolean shutdownStartedForLifecycleTest() {
+        return shutdownStarted.get();
+    }
+
+    boolean ownerRetirementRequestedForLifecycleTest() {
+        return ownerRetirementRequested.get();
     }
 
     private static int configBatchLimit() {
@@ -252,15 +423,74 @@ public final class GpuChunkBatcher implements AutoCloseable {
         return SHARED;
     }
 
+    /** True once OpenCL backend shutdown has begun; prevents late scope-retirement rebinds. */
+    public static boolean backendShutdownRequested() {
+        return BACKEND_SHUTDOWN.get();
+    }
+
+    static boolean retainsFailedCloseOwner(GpuChunkBatcher batcher) {
+        return FAILED_CLOSE_BATCHERS.contains(batcher);
+    }
+
+    /** Terminal backend teardown entry point. False means native resources must be retained. */
+    public static boolean shutdownBackend() {
+        java.util.List<GpuChunkBatcher> startShutdown = new java.util.ArrayList<>();
+        java.util.List<GpuChunkBatcher> pending;
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            BACKEND_SHUTDOWN.set(true);
+            SHARED = null;
+            for (GpuChunkBatcher batcher : java.util.List.copyOf(LIVE_BATCHERS)) {
+                synchronized (batcher.lifecycleBoundary) {
+                    if (!batcher.ownerRetirementRequested.get()
+                            && !batcher.lifecycleCompletion.isDone()
+                            && batcher.shutdownStarted.compareAndSet(false, true)) {
+                        batcher.running.set(false);
+                        ACTIVE_LIFECYCLES.add(batcher);
+                        startShutdown.add(batcher);
+                    }
+                }
+            }
+            // Setting BACKEND_SHUTDOWN, marking every live batcher and taking this snapshot
+            // share the admission lock with creation and requestOwnerRetirement(). No new
+            // batcher or retirement can appear behind the terminal barrier.
+            pending = java.util.List.copyOf(ACTIVE_LIFECYCLES);
+        }
+        // Wake all drainers before joining any one of them; never strand another owner
+        // behind a long in-flight CL event in the first batcher.
+        for (GpuChunkBatcher batcher : startShutdown) batcher.drainer.interrupt();
+        for (GpuChunkBatcher batcher : startShutdown) batcher.finishNormalShutdown();
+        boolean quiescent = true;
+        for (GpuChunkBatcher active : pending) {
+            if (active.awaitLifecycleCompletion() != RetirementResult.QUIESCENT) quiescent = false;
+        }
+        return quiescent && !DISPATCHER_CLOSE_FAILED.get();
+    }
+
     /**
      * Shuts down the shared batcher if present (drains/serves pending requests, stops
      * the batcher thread, closes the dispatcher). Idempotent no-op when none is set.
-     * Wired additively into {@link OpenCLBackend#shutdown()}.
+     * Used when replacing the singleton; backend teardown uses {@link #shutdownBackend()}.
      */
     public static void shutdownShared() {
-        GpuChunkBatcher b = SHARED;
+        GpuChunkBatcher b;
+        boolean startShutdown = false;
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            b = SHARED;
+            SHARED = null;
+            if (b != null) {
+                synchronized (b.lifecycleBoundary) {
+                    if (!b.ownerRetirementRequested.get()
+                            && b.shutdownStarted.compareAndSet(false, true)) {
+                        b.running.set(false);
+                        ACTIVE_LIFECYCLES.add(b);
+                        startShutdown = true;
+                    }
+                }
+            }
+        }
         if (b != null) {
-            b.shutdown(); // instance shutdown clears SHARED
+            if (startShutdown) b.finishNormalShutdown();
+            else b.shutdown();
         }
     }
 
@@ -301,7 +531,12 @@ public final class GpuChunkBatcher implements AutoCloseable {
                     "GpuChunkBatcher has no primary dispatcher — use submitTo(target, ...)"));
             return new SubmitHandle(f, null);
         }
-        GeometryKey key = new GeometryKey(null, strx, stry, strz, dimX, dimY, dimZ);
+        if (ownerWorldScope != null && !GpuWorldgenPolicy.isWorldScopeLive(ownerWorldScope)) {
+            f.completeExceptionally(new java.util.concurrent.CancellationException(
+                    "GpuChunkBatcher owner world scope is no longer live"));
+            return new SubmitHandle(f, null);
+        }
+        GeometryKey key = new GeometryKey(null, ownerWorldScope, strx, stry, strz, dimX, dimY, dimZ);
         Req r = new Req(ox, oy, oz, key, f, aux);
         SubmitHandle handle = new SubmitHandle(f, r);
         enqueueReq(r, f);
@@ -323,19 +558,38 @@ public final class GpuChunkBatcher implements AutoCloseable {
                                                 int ox, int oy, int oz,
                                                 int strx, int stry, int strz,
                                                 int dimX, int dimY, int dimZ) {
+        return submitTo(null, target, ox, oy, oz, strx, stry, strz, dimX, dimY, dimZ);
+    }
+
+    /**
+     * Scope-bound AUX submit. The scope is part of the grouping identity and is checked
+     * when enqueued and again by the drainer immediately before dispatcher submission.
+     * This closes the async gap between the caller's authorization and a delayed batch
+     * flush. A missing or expired production scope fails the future; it never dispatches.
+     */
+    public CompletableFuture<double[]> submitTo(GpuWorldgenPolicy.WorldScope worldScope,
+                                                GpuBatchDispatcher target,
+                                                int ox, int oy, int oz,
+                                                int strx, int stry, int strz,
+                                                int dimX, int dimY, int dimZ) {
         CompletableFuture<double[]> f = new CompletableFuture<>();
         if (target == null) {
             f.completeExceptionally(new IllegalArgumentException("submitTo: null target dispatcher"));
             return f;
         }
-        GeometryKey key = new GeometryKey(target, strx, stry, strz, dimX, dimY, dimZ);
-        enqueueReq(new Req(ox, oy, oz, key, f, null), f);
+        if (worldScope != null && !GpuWorldgenPolicy.isWorldScopeLive(worldScope)) {
+            f.completeExceptionally(new java.util.concurrent.CancellationException(
+                    "GpuChunkBatcher target world scope is no longer live"));
+            return f;
+        }
+        GeometryKey key = new GeometryKey(target, worldScope, strx, stry, strz, dimX, dimY, dimZ);
+        enqueueReq(new Req(ox, oy, oz, key, f, null, null, worldScope), f);
         return f;
     }
 
     /** Common enqueue tail shared by {@link #submitCompact}, {@link #submitCombined} and {@link #submitTo}. */
     private void enqueueReq(Req r, CompletableFuture<double[]> f) {
-        if (!running.get()) {
+        if (!running.get() || ownerRetirementRequested.get()) {
             rejectedCount.incrementAndGet();
             failReq(r, f, new IllegalStateException("GpuChunkBatcher is not running"));
             return;
@@ -351,7 +605,7 @@ public final class GpuChunkBatcher implements AutoCloseable {
         requestCount.incrementAndGet();
         // A late shutdown could have flipped running after our check; if so, make sure
         // this request can't be orphaned (the drainer may have already exited).
-        if (!running.get() && queue.remove(r)) {
+        if ((!running.get() || ownerRetirementRequested.get()) && queue.remove(r)) {
             requestCount.decrementAndGet();
             failReq(r, f, new IllegalStateException("GpuChunkBatcher is shutting down"));
         }
@@ -397,7 +651,14 @@ public final class GpuChunkBatcher implements AutoCloseable {
             cf.completeExceptionally(ex);
             return new CombinedHandle(f, cf);
         }
-        GeometryKey key = new GeometryKey(null, strx, stry, strz, dimX, dimY, dimZ);
+        if (ownerWorldScope != null && !GpuWorldgenPolicy.isWorldScopeLive(ownerWorldScope)) {
+            java.util.concurrent.CancellationException ex = new java.util.concurrent.CancellationException(
+                    "GpuChunkBatcher owner world scope is no longer live");
+            f.completeExceptionally(ex);
+            cf.completeExceptionally(ex);
+            return new CombinedHandle(f, cf);
+        }
+        GeometryKey key = new GeometryKey(null, ownerWorldScope, strx, stry, strz, dimX, dimY, dimZ);
         Req r = new Req(ox, oy, oz, key, f, null, cf);
         enqueueReq(r, f);
         return new CombinedHandle(f, cf);
@@ -541,15 +802,27 @@ public final class GpuChunkBatcher implements AutoCloseable {
      * Idempotent.
      */
     public void shutdown() {
-        if (!running.compareAndSet(true, false)) {
-            return; // already shut down
+        boolean beginShutdown = false;
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            synchronized (lifecycleBoundary) {
+                if (!ownerRetirementRequested.get()
+                        && shutdownStarted.compareAndSet(false, true)) {
+                    running.set(false);
+                    ACTIVE_LIFECYCLES.add(this);
+                    beginShutdown = true;
+                }
+            }
         }
+        if (!beginShutdown) {
+            awaitLifecycleCompletion();
+            return;
+        }
+        finishNormalShutdown();
+    }
+
+    private void finishNormalShutdown() {
         drainer.interrupt(); // wake the drainer out of poll(); it will flush + exit
-        try {
-            drainer.join(SHUTDOWN_JOIN_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        joinUninterruptibly(drainer, "normal batcher drainer");
         // Fail anything that slipped into the queue after running flipped (drainer gone).
         RuntimeException ex = new RuntimeException("GpuChunkBatcher shut down");
         Req r;
@@ -559,42 +832,207 @@ public final class GpuChunkBatcher implements AutoCloseable {
         // Stop the completer: poison AFTER the drainer stopped enqueueing, so every
         // in-flight batch is drained + served first (each bounded by one GPU round
         // trip). Longer join than the drainer's — it may have a full pipeline to eat.
-        try {
-            completionQueue.put(POISON);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        try {
-            completer.join(SHUTDOWN_JOIN_MILLIS * 2);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        // Abnormal path only (a timed-out join above): fail + release whatever is left
-        // so no submitter hangs and no pipeline slot leaks.
-        PendingBatch pb;
-        while ((pb = completionQueue.poll()) != null) {
-            if (pb == POISON) {
-                continue;
-            }
-            failBatchReqs(pb.reqs(), ex);
-            try {
-                pb.inf().release();
-            } catch (Throwable ignored) {
-            }
-        }
+        putPoisonUninterruptibly();
+        joinUninterruptibly(completer, "normal batcher completer");
         // The PRIMARY dispatcher is owned by this batcher; aux program-slot dispatchers
         // (submitTo targets) are owned + closed by their registrants AFTER this join.
-        if (dispatcher != null) {
-            try {
-                dispatcher.close();
-            } catch (Throwable ignored) {
-            }
-        }
-        if (SHARED == this) {
-            SHARED = null;
-        }
+        boolean closed = closePrimaryDispatcher();
         LOGGER.info("[SuperChunk-GPU] [batch-agg] batcher '{}' shut down (requests={} dispatches={} served={}).",
                 drainer.getName(), requestCount.get(), dispatchCount.get(), servedCount.get());
+        completeLifecycle(closed ? RetirementResult.QUIESCENT : RetirementResult.CLOSE_FAILED);
+    }
+
+    /**
+     * Retires the world-owned singleton without flushing queued work into a retired scope.
+     * Admission closes immediately. The drainer fails queued/bucketed futures; batches already
+     * handed to the completer are awaited and completed before the primary dispatcher is closed.
+     * The ServerLevel close hook uses {@link #requestOwnerRetirement()} and observes one shared
+     * completion stage after both worker threads and admitted CL jobs stop.
+     */
+    public RetirementRequest requestOwnerRetirement() {
+        RetirementDisposition disposition;
+        boolean startRetirement = false;
+        boolean wakeExistingDrainer = false;
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            synchronized (lifecycleBoundary) {
+                if (lifecycleCompletion.isDone()) {
+                    disposition = RetirementDisposition.ALREADY_COMPLETE;
+                } else if (ownerRetirementRequested.get()) {
+                    disposition = RetirementDisposition.ALREADY_RETIRING;
+                } else if (shutdownStarted.get()) {
+                    // Normal shutdown may still be flushing queued primary work. A world
+                    // retirement that arrives in that window must switch the drainer to
+                    // its fail-pending branch without starting a second retirement worker.
+                    ownerRetirementRequested.set(true);
+                    running.set(false);
+                    retirementModeChosen.countDown();
+                    disposition = RetirementDisposition.SHUTDOWN_ALREADY_STARTED;
+                    wakeExistingDrainer = true;
+                } else if (BACKEND_SHUTDOWN.get()) {
+                    disposition = RetirementDisposition.BACKEND_TERMINAL;
+                } else {
+                    ownerRetirementRequested.set(true);
+                    running.set(false);
+                    ACTIVE_LIFECYCLES.add(this);
+                    disposition = RetirementDisposition.STARTED;
+                    startRetirement = true;
+                }
+            }
+        }
+        if (startRetirement) startOwnerRetirementAsync();
+        else if (wakeExistingDrainer) drainer.interrupt();
+        return new RetirementRequest(disposition, lifecycleCompletion);
+    }
+
+    private void startOwnerRetirementAsync() {
+        Thread retire = new Thread(this::finishOwnerRetirement,
+                "SuperChunk-GPU-batcher-retire");
+        retire.setDaemon(true);
+        try {
+            retire.start();
+            retirementModeChosen.countDown();
+            drainer.interrupt();
+        } catch (Throwable failure) {
+            // Never make ServerLevel.close wait for queue/CL quiescence. If a helper
+            // thread cannot be created, hand finalization to the already-running drainer.
+            LOGGER.warn("[SuperChunk-GPU] [batch] could not start retirement helper; "
+                    + "the drainer will finish retirement asynchronously.", failure);
+            retirementOnDrainer.set(true);
+            retirementModeChosen.countDown();
+            drainer.interrupt();
+        }
+    }
+
+    private void finishOwnerRetirement() {
+        // Joining the drainer fences an enqueue already in progress. No resources are
+        // released until both it and the completer have stopped using their CL objects.
+        if (Thread.currentThread() != drainer) {
+            joinUninterruptibly(drainer, "owner-retirement drainer");
+        }
+        putPoisonUninterruptibly();
+        joinUninterruptibly(completer, "owner-retirement completer");
+        boolean closed = closePrimaryDispatcher();
+        if (!closed) {
+            LOGGER.error("[SuperChunk-GPU] [batch] owner retirement stopped its workers but dispatcher close failed; "
+                    + "backend native teardown is vetoed and the dispatcher will not be closed a second time.");
+        } else {
+            LOGGER.info("[SuperChunk-GPU] [batch] retired world-owned batcher '{}' after admitted CL work resolved.",
+                    drainer.getName());
+        }
+        completeLifecycle(closed ? RetirementResult.QUIESCENT : RetirementResult.CLOSE_FAILED);
+    }
+
+    private void completeLifecycle(RetirementResult result) {
+        if (result == RetirementResult.CLOSE_FAILED) {
+            DISPATCHER_CLOSE_FAILED.set(true);
+            FAILED_CLOSE_BATCHERS.add(this);
+        }
+        // Publish terminal state before invoking callbacks: a retirement callback may
+        // immediately install a replacement and must not wait on its own completion.
+        synchronized (SHARED_LIFECYCLE_LOCK) {
+            synchronized (lifecycleBoundary) {
+                shutdownStarted.set(true);
+            }
+            if (SHARED == this) SHARED = null;
+            ACTIVE_LIFECYCLES.remove(this);
+            LIVE_BATCHERS.remove(this);
+        }
+        // Workers have joined and the single dispatcher close attempt has resolved. Do
+        // not hold the admission lock while dependent cleanup/rebind callbacks run.
+        lifecycleCompletion.complete(result);
+    }
+
+    private void awaitRetirementModeChosen() {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                retirementModeChosen.await();
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private RetirementResult awaitLifecycleCompletion() {
+        boolean interrupted = false;
+        long nextWarning = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        try {
+            while (true) {
+                try {
+                    return lifecycleCompletion.get(30, TimeUnit.SECONDS);
+                } catch (TimeoutException timeout) {
+                    if (System.nanoTime() >= nextWarning) {
+                        LOGGER.warn("[SuperChunk-GPU] [batch] still waiting for '{}' lifecycle quiescence; "
+                                        + "native resources remain retained while workers are active.",
+                                drainer.getName());
+                        nextWarning = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                    }
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                } catch (ExecutionException failure) {
+                    LOGGER.error("[SuperChunk-GPU] [batch] lifecycle completion failed unexpectedly.",
+                            failure.getCause());
+                    return RetirementResult.CLOSE_FAILED;
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    private void putPoisonUninterruptibly() {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                completionQueue.put(POISON);
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private static void joinUninterruptibly(Thread thread, String phase) {
+        if (!shouldJoin(Thread.currentThread(), thread)) return;
+        boolean interrupted = false;
+        long nextWarning = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (thread.isAlive()) {
+            try {
+                thread.join(30_000L);
+                if (thread.isAlive() && System.nanoTime() >= nextWarning) {
+                    LOGGER.warn("[SuperChunk-GPU] [batch] still waiting for {} thread '{}'; "
+                                    + "native resources remain retained.", phase, thread.getName());
+                    nextWarning = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                }
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    static boolean shouldJoin(Thread current, Thread target) {
+        return target != null && target != current;
+    }
+
+    private boolean closePrimaryDispatcher() {
+        if (primaryDispatcherCloser == null) return true;
+        if (primaryDispatcherCloseSucceeded) return true;
+        if (!primaryDispatcherCloseAttempted.compareAndSet(false, true)) return primaryDispatcherCloseSucceeded;
+        try {
+            primaryDispatcherCloser.run();
+            primaryDispatcherCloseSucceeded = true;
+            return true;
+        } catch (Throwable failure) {
+            LOGGER.warn("[SuperChunk-GPU] [batch] primary dispatcher close failed.", failure);
+            // close() may have partially released native state before throwing. Retrying
+            // could double-free it, so fail closed and veto backend native teardown.
+            DISPATCHER_CLOSE_FAILED.set(true);
+            return false;
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -602,6 +1040,7 @@ public final class GpuChunkBatcher implements AutoCloseable {
     // ----------------------------------------------------------------------
 
     private void drainLoop() {
+        if (beforeDrainLoopForTest != null) beforeDrainLoopForTest.run();
         final Map<GeometryKey, ArrayDeque<Req>> buckets = new HashMap<>();
         final Map<GeometryKey, Long> deadlineNanos = new HashMap<>();
         while (true) {
@@ -621,6 +1060,26 @@ public final class GpuChunkBatcher implements AutoCloseable {
                     }
                 }
                 boolean stopping = !running.get();
+                if (ownerRetirementRequested.get()) {
+                    awaitRetirementModeChosen();
+                    RuntimeException ex = new IllegalStateException("GpuChunkBatcher world owner retired");
+                    Req queued;
+                    while ((queued = queue.poll()) != null) {
+                        failReq(queued, queued.future, ex);
+                    }
+                    for (ArrayDeque<Req> bucket : buckets.values()) {
+                        Req pending;
+                        while ((pending = bucket.poll()) != null) {
+                            failReq(pending, pending.future, ex);
+                        }
+                    }
+                    buckets.clear();
+                    deadlineNanos.clear();
+                    if (retirementOnDrainer.get()) {
+                        finishOwnerRetirement();
+                    }
+                    return;
+                }
                 flushReady(buckets, deadlineNanos, stopping);
                 if (stopping && queue.isEmpty() && buckets.isEmpty()) {
                     return;
@@ -667,6 +1126,11 @@ public final class GpuChunkBatcher implements AutoCloseable {
 
     private void addToBucket(Req r, Map<GeometryKey, ArrayDeque<Req>> buckets,
                              Map<GeometryKey, Long> deadlineNanos) {
+        if (r.worldScope != null && !GpuWorldgenPolicy.isWorldScopeLive(r.worldScope)) {
+            failReq(r, r.future, new java.util.concurrent.CancellationException(
+                    "GpuChunkBatcher target world scope expired before batching"));
+            return;
+        }
         ArrayDeque<Req> b = buckets.get(r.key);
         if (b == null) {
             b = new ArrayDeque<>();
@@ -758,6 +1222,11 @@ public final class GpuChunkBatcher implements AutoCloseable {
     }
 
     private void dispatchBatch(GeometryKey key, ArrayDeque<Req> b) {
+        if (beforeBatchDispatchForTest != null) beforeBatchDispatchForTest.run();
+        if (key.worldScope() != null && !GpuWorldgenPolicy.isWorldScopeLive(key.worldScope())) {
+            failPendingScope(b, key.worldScope(), "expired before dispatch");
+            return;
+        }
         int K = 0;
         while (K < batchLimit && !b.isEmpty()) {
             Req r = b.poll();
@@ -837,9 +1306,43 @@ public final class GpuChunkBatcher implements AutoCloseable {
                 }
             }
             long t0 = System.nanoTime();
-            inf = disp.enqueueBatch(origins, K,
-                    key.strx(), key.stry(), key.strz(),
-                    key.dimX(), key.dimY(), key.dimZ(), auxes, anyClim);
+            final int batchK = K;
+            final CompactIds.ChunkAux[] batchAuxes = auxes;
+            final boolean batchAnyClim = anyClim;
+            synchronized (dispatchBoundary) {
+                if (ownerRetirementRequested.get()) {
+                    throw new java.util.concurrent.CancellationException("GpuChunkBatcher world owner retired");
+                }
+                GpuBatchDispatcher.InFlight[] submitted = new GpuBatchDispatcher.InFlight[1];
+                Runnable enqueue = () -> submitted[0] = disp.enqueueBatch(origins, batchK,
+                        key.strx(), key.stry(), key.strz(),
+                        key.dimX(), key.dimY(), key.dimZ(), batchAuxes, batchAnyClim,
+                        key.worldScope() == null ? GpuAuthorizationDiagnostics.WorldBucket.UNKNOWN
+                                : key.worldScope().diagnosticBucket());
+                boolean scopeAccepted;
+                if (key.worldScope() == null) {
+                    // Primary requests belong to this batcher's own scope. The retirement
+                    // flag and this boundary define their admission point; requestOwnerRetirement()
+                    // closes that gate; retirement joins the drainer before closing resources.
+                    if (ownerRetirementRequested.get()) {
+                        throw new java.util.concurrent.CancellationException(
+                                "GpuChunkBatcher world owner retired");
+                    }
+                    enqueue.run();
+                    scopeAccepted = true;
+                } else {
+                    // The policy grants a short-lived dispatch lease under the same lock
+                    // used by retireLevel(), then releases that lock before enqueueBatch
+                    // can wait for a free pipeline slot. A pre-retirement lease is admitted;
+                    // the target scope is rechecked above and is never guessed from a permit.
+                    scopeAccepted = GpuWorldgenPolicy.runIfWorldScopeLive(key.worldScope(), enqueue);
+                }
+                if (!scopeAccepted) {
+                    throw new java.util.concurrent.CancellationException(
+                            "GpuChunkBatcher target world scope expired before dispatcher enqueue");
+                }
+                inf = submitted[0];
+            }
             pipeEnqueueNanos.addAndGet(System.nanoTime() - t0);
             dispatchCount.incrementAndGet();
             if (inf != null) {
@@ -848,7 +1351,9 @@ public final class GpuChunkBatcher implements AutoCloseable {
                 handedOff = true;
             }
         } catch (Throwable t) {
-            LOGGER.warn("[SuperChunk-GPU] [batch-agg] batch enqueue failed (K={}).", K, t);
+            if (!ownerRetirementRequested.get()) {
+                LOGGER.warn("[SuperChunk-GPU] [batch-agg] batch enqueue failed (K={}).", K, t);
+            }
         }
         if (!handedOff) {
             RuntimeException ex = new RuntimeException("GPU batched dispatch failed");
@@ -858,6 +1363,20 @@ public final class GpuChunkBatcher implements AutoCloseable {
                     inf.release();
                 } catch (Throwable ignored) {
                 }
+            }
+        }
+    }
+
+    /** Fails queued entries from an expired target scope without touching its dispatcher. */
+    private static void failPendingScope(ArrayDeque<Req> requests,
+                                         GpuWorldgenPolicy.WorldScope scope, String reason) {
+        var iterator = requests.iterator();
+        while (iterator.hasNext()) {
+            Req request = iterator.next();
+            if (request.worldScope == scope) {
+                iterator.remove();
+                failReq(request, request.future, new java.util.concurrent.CancellationException(
+                        "GpuChunkBatcher target world scope " + reason));
             }
         }
     }
@@ -1009,6 +1528,7 @@ public final class GpuChunkBatcher implements AutoCloseable {
      * geometry share a batch.
      */
     private record GeometryKey(GpuBatchDispatcher target,
+                               GpuWorldgenPolicy.WorldScope worldScope,
                                int strx, int stry, int strz, int dimX, int dimY, int dimZ) {
     }
 
@@ -1026,6 +1546,8 @@ public final class GpuChunkBatcher implements AutoCloseable {
          * it could not (caller funnels the miss); {@code null} = plain density request.
          */
         final CompletableFuture<double[]> climFuture;
+        /** Optional authorization target for async AUX requests; null is reserved for legacy/synthetic callers. */
+        final GpuWorldgenPolicy.WorldScope worldScope;
         /**
          * SUBMIT time (nanoTime at enqueue): the documented flush-window contract anchors
          * at the group's OLDEST PENDING REQUEST, so the deadline must be derived from when
@@ -1042,11 +1564,17 @@ public final class GpuChunkBatcher implements AutoCloseable {
 
         Req(int ox, int oy, int oz, GeometryKey key, CompletableFuture<double[]> future,
             CompactIds.ChunkAux aux) {
-            this(ox, oy, oz, key, future, aux, null);
+            this(ox, oy, oz, key, future, aux, null, key.worldScope());
         }
 
         Req(int ox, int oy, int oz, GeometryKey key, CompletableFuture<double[]> future,
             CompactIds.ChunkAux aux, CompletableFuture<double[]> climFuture) {
+            this(ox, oy, oz, key, future, aux, climFuture, key.worldScope());
+        }
+
+        Req(int ox, int oy, int oz, GeometryKey key, CompletableFuture<double[]> future,
+            CompactIds.ChunkAux aux, CompletableFuture<double[]> climFuture,
+            GpuWorldgenPolicy.WorldScope worldScope) {
             this.ox = ox;
             this.oy = oy;
             this.oz = oz;
@@ -1054,6 +1582,7 @@ public final class GpuChunkBatcher implements AutoCloseable {
             this.future = future;
             this.aux = aux;
             this.climFuture = climFuture;
+            this.worldScope = worldScope;
             this.submitNanos = System.nanoTime();
         }
     }

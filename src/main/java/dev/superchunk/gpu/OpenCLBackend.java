@@ -84,6 +84,8 @@ public final class OpenCLBackend {
      * pointing at an already-released context.
      */
     private static volatile boolean shuttingDown = false;
+    /** Fail-closed terminal state when a batcher cannot prove its native dispatcher was released. */
+    private static volatile boolean nativeTeardownBlocked = false;
 
     private OpenCLBackend() {
     }
@@ -129,6 +131,10 @@ public final class OpenCLBackend {
 
     /** Standalone diagnostics can supply an isolated config without touching the game config. */
     static synchronized void init(GpuConfig explicitConfig) {
+        if (nativeTeardownBlocked) {
+            LOGGER.error("[SuperChunk-GPU] prior batcher close failed; retaining the OpenCL context and refusing reinitialization.");
+            return;
+        }
         // A prior shutdown() leaves shuttingDown=true so any late resource-owner
         // registration self-closes; clear it now that we are (re)initializing and
         // will legitimately accept resource owners again.
@@ -318,8 +324,9 @@ public final class OpenCLBackend {
             for (int p = 0; p < platformCount; p++) {
                 long platform = platforms.get(p);
                 String pName = getPlatformInfo(platform, CL_PLATFORM_NAME);
+                String pVendor = getPlatformInfo(platform, CL_PLATFORM_VENDOR);
                 String pVersion = getPlatformInfo(platform, CL_PLATFORM_VERSION);
-                LOGGER.info("[SuperChunk-GPU]  Platform[{}]: {} ({})", p, pName, pVersion);
+                LOGGER.info("[SuperChunk-GPU]  Platform[{}]: {} [{}] ({})", p, pName, pVendor, pVersion);
 
                 long[] deviceIds = getDeviceIds(platform);
                 if (deviceIds.length == 0) {
@@ -327,7 +334,7 @@ public final class OpenCLBackend {
                     continue;
                 }
                 for (int d = 0; d < deviceIds.length; d++) {
-                    OpenCLDevice dev = readDevice(platform, deviceIds[d], p, d);
+                    OpenCLDevice dev = readDevice(platform, deviceIds[d], p, d, pName, pVendor);
                     result.add(dev);
                     LOGGER.info("[SuperChunk-GPU]   Device[{}]: {}", d, dev.describe());
                 }
@@ -369,7 +376,8 @@ public final class OpenCLBackend {
         }
     }
 
-    private static OpenCLDevice readDevice(long platform, long device, int platformIndex, int deviceIndex) {
+    private static OpenCLDevice readDevice(long platform, long device, int platformIndex, int deviceIndex,
+                                           String platformName, String platformVendor) {
         String name = getDeviceInfoString(device, CL_DEVICE_NAME);
         String vendor = getDeviceInfoString(device, CL_DEVICE_VENDOR);
         int vendorId = getDeviceInfoInt(device, CL_DEVICE_VENDOR_ID);
@@ -391,7 +399,7 @@ public final class OpenCLBackend {
                 computeUnits, globalMem, getDeviceInfoLong(device, CL_DEVICE_LOCAL_MEM_SIZE),
                 getDeviceInfoLong(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE),
                 getDeviceInfoSize(device, CL_DEVICE_MAX_WORK_GROUP_SIZE), getWorkItemSizes(device),
-                singleFpConfig, fpConfig, fp64, crDivideFp32, nvCompilerOptions);
+                singleFpConfig, fpConfig, fp64, crDivideFp32, nvCompilerOptions, platformName, platformVendor);
     }
 
     /** Picks a device per config: explicit indices, else fp64-preferred GPU, else first. */
@@ -661,13 +669,6 @@ public final class OpenCLBackend {
             CompileProgressWindow.finishNow();
         } catch (Throwable ignored) {
         }
-        // LIVE DF fusion: close the fused interpolator(s) + clear the fusion registry
-        // FIRST so no cl_program/cl_mem leaks. close() is idempotent, so the
-        // resource-owner loop below closing them again is a harmless no-op.
-        try {
-            dev.superchunk.gpu.dfc.ChunkGridCache.shutdownFused();
-        } catch (Throwable ignored) {
-        }
         // Cross-chunk aggregator: stop the shared batcher thread pair, serve/drain its
         // pending futures and close its primary dispatcher. Idempotent no-op when no
         // batcher is installed (the boot self-test shuts down its own instance).
@@ -675,15 +676,38 @@ public final class OpenCLBackend {
         // (sharedBatcher, 2026-07-07) climate requests ride THIS batcher targeting
         // BiomeClimateCache's aux dispatchers — those dispatchers may only close once
         // the shared drainer+completer are joined (no in-flight batch references them).
+        // It must also run BEFORE shutdownFused(): completer-side future callbacks may use
+        // the owning fused interpolator to produce an on-device field while depositing a
+        // completed grid. Closing fused programs before joining those callbacks can race
+        // their OpenCL queues/buffers.
+        boolean batcherNativeTeardownSafe = false;
         try {
-            dev.superchunk.gpu.dfc.GpuChunkBatcher.shutdownShared();
+            batcherNativeTeardownSafe = dev.superchunk.gpu.dfc.GpuChunkBatcher.shutdownBackend();
+        } catch (Throwable failure) {
+            LOGGER.error("[SuperChunk-GPU] batcher shutdown did not establish native-resource quiescence.", failure);
+        }
+        if (!batcherNativeTeardownSafe) {
+            // A dispatcher close can fail after partially releasing resources. Do not
+            // retry it or release its OpenCL context underneath it; disable the backend
+            // and keep native handles retained for process teardown.
+            nativeTeardownBlocked = true;
+            available = false;
+            LOGGER.error("[SuperChunk-GPU] OpenCL teardown aborted because a batcher dispatcher did not close cleanly; "
+                    + "native context/resources are retained and GPU use is disabled for this process.");
+            return;
+        }
+        // LIVE DF fusion: close the fused interpolator(s) + clear the fusion registry only
+        // after the batcher completer has joined. close() is idempotent, so the resource-owner
+        // loop below closing them again is a harmless no-op.
+        try {
+            dev.superchunk.gpu.dfc.ChunkGridCache.shutdownFused();
         } catch (Throwable ignored) {
         }
         try {
             dev.superchunk.gpu.dfc.BiomeClimateCache.shutdown();
         } catch (Throwable ignored) {
         }
-        // Now that the batcher drainer thread has been joined by shutdownShared(),
+        // Now that the batcher drainer thread has been joined by shutdownBackend(),
         // no late whenComplete put() can land in GpuBatchStore anymore. Clear the
         // batch store + pooled field buffers HERE (split out of shutdownFused, which
         // ran before the drainer join) so those final-flush grids/holders can't leak

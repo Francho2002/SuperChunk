@@ -3,6 +3,7 @@ package dev.superchunk.mixin;
 import dev.superchunk.com.ishland.c2me.base.mixin.access.IChunkAccessNoiseChunk;
 import dev.superchunk.gpu.dfc.CompactConsume;
 import dev.superchunk.gpu.dfc.CompactIds;
+import dev.superchunk.gpu.dfc.GpuAuthorizationDiagnostics;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
@@ -45,20 +46,34 @@ public abstract class MixinNoiseChunkGeneratorCompactIds {
                                                RandomState random, ChunkAccess chunk,
                                                int minCellY, int cellCountY,
                                                CallbackInfoReturnable<ChunkAccess> cir) {
+        GpuAuthorizationDiagnostics.record(
+                GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_HEAD_HANDLER_ENTERED);
         if (!CompactIds.CONSUME && !CompactIds.VERIFY) {
             return;
         }
         try {
             NoiseChunk nc = ((IChunkAccessNoiseChunk) chunk).superchunk$getNoiseChunk();
             if (CompactIds.VERIFY) {
-                CompactConsume.verifyArm(chunk, nc, minCellY, cellCountY);
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_VERIFY_HANDLER_ENTERED);
+                CompactConsume.verifyArm((NoiseBasedChunkGenerator) (Object) this, random,
+                        chunk, nc, minCellY, cellCountY);
                 return;
             }
             if (CompactConsume.consumeFill((NoiseBasedChunkGenerator) (Object) this,
-                    chunk, nc, minCellY, cellCountY)) {
+                    random, chunk, nc, minCellY, cellCountY)) {
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_CONSUME_SUCCEEDED);
                 cir.setReturnValue(chunk);
+            } else {
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_CONSUME_FELL_BACK);
             }
         } catch (Throwable ignored) {
+            if (CompactIds.CONSUME) {
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_CONSUME_FELL_BACK);
+            }
             // Never break gen — faults are counted/logged inside CompactConsume.
         }
     }
@@ -71,11 +86,15 @@ public abstract class MixinNoiseChunkGeneratorCompactIds {
                                                      RandomState random, ChunkAccess chunk,
                                                      int minCellY, int cellCountY,
                                                      CallbackInfoReturnable<ChunkAccess> cir) {
+        GpuAuthorizationDiagnostics.record(
+                GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_TAIL_HANDLER_ENTERED);
         if (!CompactIds.VERIFY) {
             return;
         }
         try {
-            CompactConsume.verifyCompare((NoiseBasedChunkGenerator) (Object) this, chunk);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_COMPACT_VERIFY_HANDLER_ENTERED);
+            CompactConsume.verifyCompare((NoiseBasedChunkGenerator) (Object) this, random, chunk);
         } catch (Throwable ignored) {
         }
     }

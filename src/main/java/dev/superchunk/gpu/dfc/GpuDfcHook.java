@@ -146,6 +146,7 @@ public final class GpuDfcHook {
             return delegate;
         } catch (UnsupportedDfNodeException e) {
             cpuCount.incrementAndGet();
+            GpuAuthorizationDiagnostics.recordCompileFallback("unsupported node: " + e.getMessage());
             // Hygiene: this was previously a SILENT null (the DF just vanished onto the
             // CPU path). Router DFs that fail to GPU-compile are exactly what the boot
             // log needs to surface — id + reason at INFO.
@@ -154,6 +155,7 @@ public final class GpuDfcHook {
             return null;
         } catch (Throwable t) {
             cpuCount.incrementAndGet();
+            GpuAuthorizationDiagnostics.recordCompileFallback("emit threw");
             LOGGER.info("[SuperChunk-GPU] router DF {} (batch #{}) emit threw — CPU-only for this DF: {}",
                     describeDf(ast), batch.size(), String.valueOf(t));
             return null;
@@ -236,10 +238,12 @@ public final class GpuDfcHook {
             if (gpu != null) {
                 p.delegate().resolve(gpu);
                 gpuCount.incrementAndGet();
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_DF_GPU_READY);
                 merged++;
             } else {
                 cpuCount.incrementAndGet();
                 String reason = GpuDensityFunction.takeLastCompileFailure();
+                GpuAuthorizationDiagnostics.recordCompileFallback(reason);
                 LOGGER.info("[SuperChunk-GPU] router DF {} ({}) did not resolve from the merged program — {}. CPU-only for this DF.",
                         p.ast() == null ? "<null-ast>" : p.ast().getClass().getSimpleName(), p.tag(),
                         reason != null ? reason : "reason unavailable");
@@ -257,14 +261,17 @@ public final class GpuDfcHook {
                 if (gpu != null) {
                     p.delegate().resolve(gpu);
                     gpuCount.incrementAndGet();
+                    GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_DF_GPU_READY);
                 } else {
                     cpuCount.incrementAndGet();
                     String reason = GpuDensityFunction.takeLastCompileFailure();
+                    GpuAuthorizationDiagnostics.recordCompileFallback(reason);
                     LOGGER.info("[SuperChunk-GPU] router DF {} ({}) did not GPU-compile — {}. CPU-only for this DF.",
                             describeDf(p.ast()), p.tag(), reason != null ? reason : "reason unavailable");
                 }
             } catch (Throwable t) {
                 cpuCount.incrementAndGet();
+                GpuAuthorizationDiagnostics.recordCompileFallback("GPU build threw");
                 LOGGER.info("[SuperChunk-GPU] router DF {} ({}) GPU build threw — CPU-only for this DF: {}",
                         describeDf(p.ast()), p.tag(), String.valueOf(t));
             }
@@ -292,16 +299,19 @@ public final class GpuDfcHook {
             if (gpu == null) {
                 cpuCount.incrementAndGet();
                 String reason = GpuDensityFunction.takeLastCompileFailure();
+                GpuAuthorizationDiagnostics.recordCompileFallback(reason);
                 LOGGER.info("[SuperChunk-GPU] cache-wrapper DF {} did not GPU-compile — {}. CPU-only for this DF.",
                         describeDf(ast), reason != null ? reason : "reason unavailable");
                 return null;
             }
             int g = gpuCount.incrementAndGet();
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_DF_GPU_READY);
             LOGGER.info("[SuperChunk-GPU] cache-wrapper DF compiled to GPU (#{}, fp32={}). Total GPU/CPU = {}/{}",
                     g, gpu.isFp32(), g, cpuCount.get());
             return new GpuDfcDelegate(gpu);
         } catch (Throwable t) {
             cpuCount.incrementAndGet();
+            GpuAuthorizationDiagnostics.recordCompileFallback("cache-wrapper GPU build threw");
             LOGGER.info("[SuperChunk-GPU] cache-wrapper DF {} GPU build threw — CPU-only for this DF: {}",
                     describeDf(ast), String.valueOf(t));
             return null;
@@ -364,16 +374,19 @@ public final class GpuDfcHook {
             if (gpu != null) {
                 compiled.c2me$setGpuDelegate(new GpuDfcDelegate(gpu));
                 int g = gpuCount.incrementAndGet();
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.COMPILE_DF_GPU_READY);
                 LOGGER.info("[SuperChunk-GPU] DF compiled to GPU (#{}, fp32={}). Total GPU/CPU = {}/{}",
                         g, gpu.isFp32(), g, cpuCount.get());
             } else {
                 int c = cpuCount.incrementAndGet();
                 String reason = GpuDensityFunction.takeLastCompileFailure();
+                GpuAuthorizationDiagnostics.recordCompileFallback(reason);
                 LOGGER.info("[SuperChunk-GPU] router DF {} did not GPU-compile (#{}) — {}. Total GPU/CPU = {}/{}",
                         describeDf(ast), c, reason != null ? reason : "reason unavailable", gpuCount.get(), c);
             }
         } catch (Throwable t) {
             cpuCount.incrementAndGet();
+            GpuAuthorizationDiagnostics.recordCompileFallback("GPU attach threw");
             LOGGER.info("[SuperChunk-GPU] router DF {} GPU-attach threw — CPU-only for this DF: {}",
                     describeDf(ast), String.valueOf(t));
         }

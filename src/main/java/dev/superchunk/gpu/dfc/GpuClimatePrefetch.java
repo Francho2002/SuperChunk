@@ -88,6 +88,27 @@ public final class GpuClimatePrefetch {
             if (genContext == null || chunk == null) {
                 return step;
             }
+            final GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.forChunk(
+                    chunk, genContext.generator(), genContext.level());
+            final GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket = permit == null
+                    ? GpuWorldgenPolicy.diagnosticBucketForChunk(chunk)
+                    : permit.worldScope().diagnosticBucket();
+            GpuWorldgenPolicy.AuthorizationDiagnostic authorization = permit == null
+                    ? GpuWorldgenPolicy.diagnoseChunkInputsForDiagnostics(
+                            chunk, genContext.generator(), genContext.level())
+                    : GpuWorldgenPolicy.diagnosePermitForDiagnostics(permit, chunk, null,
+                            GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH);
+            if (authorization != GpuWorldgenPolicy.AuthorizationDiagnostic.AUTHORIZED) {
+                if (GpuAuthorizationDiagnostics.enabled()) {
+                    GpuAuthorizationDiagnostics.recordClimateAuthorizationFailure(
+                            authorization, diagnosticBucket);
+                }
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REJECTED, diagnosticBucket);
+                return step;
+            }
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_CAPTURED, diagnosticBucket);
             // Consumer check: don't prefetch climate grids for a biome source that provably
             // never calls Climate.Sampler.sample() (The End etc.) — the deposit would be
             // consumed at beginChunk and then discarded UNREAD. See neverSamplesClimate.
@@ -110,7 +131,10 @@ public final class GpuClimatePrefetch {
             }
 
             final BiomeClimateCache.ClimatePlan plan = BiomeClimateCache.planBatch(chunk, router);
-            if (plan == null) {
+            if (plan == null || !BiomeClimateCache.isCurrentBatchPlan(plan)
+                    || !GpuWorldgenPolicy.isAuthorizedForRouter(permit,
+                    GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter())
+                    || plan.key().worldScope() != permit.worldScope()) {
                 return step;
             }
             // Already prefetched for this chunk (e.g. a re-upgrade) — don't double-submit.
@@ -121,13 +145,13 @@ public final class GpuClimatePrefetch {
             // CLIMATE CHAIN: try the combined climate+density submit on the shared
             // density batcher first; null = chain not applicable -> split path below.
             if (CHAIN_CLIMATE && !CompactIds.PROBE) {
-                Completable chained = tryChain(plan, chunk, step);
+                Completable chained = tryChain(plan, chunk, step, permit);
                 if (chained != null) {
                     return chained;
                 }
             }
 
-            final GpuPrefetchHandle handle = submitSplit(plan);
+            final GpuPrefetchHandle handle = submitSplit(plan, permit);
             if (handle == null) {
                 return step;
             }
@@ -176,8 +200,18 @@ public final class GpuClimatePrefetch {
      */
     public static GpuPrefetchHandle submitForChunk(ChunkAccess chunk, ChunkGenerator generator,
                                                    NoiseRouter router) {
+        return submitForChunk(chunk, generator, router, null);
+    }
+
+    /** Explicit DH/group variant: requires the chunk's level, generator and router source to match. */
+    public static GpuPrefetchHandle submitForChunk(ChunkAccess chunk, ChunkGenerator generator,
+                                                   NoiseRouter router, net.minecraft.server.level.ServerLevel expectedLevel) {
         try {
             if (chunk == null || router == null) {
+                return null;
+            }
+            final GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.forChunk(chunk, generator, expectedLevel);
+            if (!GpuWorldgenPolicy.isAuthorized(permit, GpuWorldgenPolicy.DispatchPath.DISTANT_HORIZONS)) {
                 return null;
             }
             try {
@@ -188,10 +222,12 @@ public final class GpuClimatePrefetch {
                 // fall through — the beginChunk-side gate still protects the arm/funnel path
             }
             final BiomeClimateCache.ClimatePlan plan = BiomeClimateCache.planBatch(chunk, router);
-            if (plan == null || GpuClimateStore.contains(plan.key())) {
+            if (plan == null || !BiomeClimateCache.isCurrentBatchPlan(plan)
+                    || !permit.matchesRouter(plan.sourceRouter())
+                    || GpuClimateStore.contains(plan.key())) {
                 return null;
             }
-            return submitSplit(plan);
+            return submitSplit(plan, permit);
         } catch (Throwable t) {
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("[SuperChunk-GPU] [biome-batch] climate submit threw — per-chunk path for this chunk.", t);
@@ -205,16 +241,33 @@ public final class GpuClimatePrefetch {
      * {@link GpuClimateStore} when it lands. Returns {@code null} when the submit could not be
      * made. Never throws.
      */
-    private static GpuPrefetchHandle submitSplit(BiomeClimateCache.ClimatePlan plan) {
-        final CompletableFuture<double[]> future;
+    private static GpuPrefetchHandle submitSplit(BiomeClimateCache.ClimatePlan plan,
+                                                 GpuWorldgenPolicy.Permit permit) {
+        final GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket = permit == null || permit.worldScope() == null
+                ? GpuAuthorizationDiagnostics.WorldBucket.UNKNOWN : permit.worldScope().diagnosticBucket();
+        if (!GpuWorldgenPolicy.isAuthorized(permit, GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH)
+                || !BiomeClimateCache.isCurrentBatchPlan(plan)
+                || !GpuWorldgenPolicy.isAuthorizedForRouter(permit,
+                GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter())
+                || plan.key().worldScope() != permit.worldScope()) {
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REJECTED, diagnosticBucket);
+            return null;
+        }
+        final CompletableFuture<double[]>[] futureHolder = new CompletableFuture[1];
         try {
-            future = plan.batcher().submitTo(plan.disp(),
-                    plan.ox(), plan.oy(), plan.oz(),
-                    4, 4, 4,
-                    plan.dimX(), plan.dimY(), plan.dimZ());
+            if (!GpuWorldgenPolicy.dispatchIfAuthorizedForRouter(permit,
+                    GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter(),
+                    () -> futureHolder[0] = plan.batcher().submitTo(plan.key().worldScope(), plan.disp(),
+                            plan.ox(), plan.oy(), plan.oz(),
+                            4, 4, 4,
+                            plan.dimX(), plan.dimY(), plan.dimZ()))) {
+                return null;
+            }
         } catch (Throwable t) {
             return null;
         }
+        final CompletableFuture<double[]> future = futureHolder[0];
         if (future == null) {
             return null;
         }
@@ -230,16 +283,36 @@ public final class GpuClimatePrefetch {
         final CompletableFuture<Void> done = new CompletableFuture<>();
         future.whenComplete((grids, err) -> {
             resolved.set(true);
+            boolean stored = false;
+            boolean contextRejected = false;
             try {
-                if (err == null && grids != null && grids.length == plan.expectLen()) {
-                    GpuClimateStore.put(plan.key(),
-                            new GpuClimateStore.Stored(plan.key().fused(), grids));
-                    GpuFillStats.recordClimatePrefetch();
+                if (err == null && grids != null && grids.length == plan.expectLen()
+                        && BiomeClimateCache.isCurrentBatchPlan(plan)) {
+                    if (GpuWorldgenPolicy.isAuthorizedForRouter(permit,
+                            GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter())
+                            && plan.key().worldScope() == permit.worldScope()) {
+                        GpuAuthorizationDiagnostics.record(
+                                GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REVALIDATED,
+                                diagnosticBucket);
+                        GpuClimateStore.put(plan.key(),
+                                new GpuClimateStore.Stored(plan.key().fused(), grids));
+                        GpuFillStats.recordClimatePrefetch();
+                        stored = true;
+                    } else {
+                        contextRejected = true;
+                    }
                 }
                 // On any failure we DON'T store: beginChunk counts the miss and
                 // FUNNELS a single-chunk request through the same drainer thread.
             } catch (Throwable ignored) {
                 // never propagate
+            }
+            if (!stored) {
+                GpuAuthorizationDiagnostics.record(
+                        contextRejected
+                                ? GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REJECTED
+                                : GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_RESULT_REJECTED,
+                        diagnosticBucket);
             }
             try {
                 done.complete(null);
@@ -255,10 +328,18 @@ public final class GpuClimatePrefetch {
      * the caller then runs the split path. Never throws.
      */
     private static Completable tryChain(BiomeClimateCache.ClimatePlan plan, ChunkAccess chunk,
-                                        Completable step) {
+                                        Completable step, GpuWorldgenPolicy.Permit permit) {
+        final GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket = permit == null || permit.worldScope() == null
+                ? GpuAuthorizationDiagnostics.WorldBucket.UNKNOWN : permit.worldScope().diagnosticBucket();
         GpuBatchStore.Key dkey = null;
         boolean pendingMarked = false;
         try {
+            if (!GpuWorldgenPolicy.isAuthorized(permit, GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH)
+                    || !BiomeClimateCache.isCurrentBatchPlan(plan)
+                    || !GpuWorldgenPolicy.isAuthorizedForRouter(permit,
+                    GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter())) {
+                return null;
+            }
             GpuChunkBatcher batcher = ChunkGridCache.liveBatcher();
             GpuFusedInterpolator denFused = ChunkGridCache.batcherFused();
             GpuBatchDispatcher denDisp = batcher == null ? null : batcher.primaryDispatcher();
@@ -268,7 +349,7 @@ public final class GpuClimatePrefetch {
             // Canonical density extent for this chunk (pre-NoiseChunk). The chain derives
             // climate origins from the density origins, so the horizontal origins must agree.
             final net.minecraft.world.level.ChunkPos pos = chunk.getPos();
-            final GpuBatchStore.Extent ext = ChunkGridCache.canonicalBatcherExtent(pos);
+            final GpuBatchStore.Extent ext = ChunkGridCache.canonicalBatcherExtent(pos, permit.worldScope());
             if (ext == null || ext.ox != plan.ox() || ext.oz != plan.oz()) {
                 return null;
             }
@@ -280,6 +361,10 @@ public final class GpuClimatePrefetch {
             // the real dimension out of the chain. A mismatched chunk rides the split path.
             // It must run BEFORE the one-time attach below, or that attach is what locks it out.
             if (ext.oy != plan.oy() || (ext.dimY - 1) * ext.sy != plan.dimY() * 4) {
+                return null;
+            }
+            final GpuWorldgenPolicy.WorldScope densityTargetScope = ChunkGridCache.batcherWorldScope();
+            if (densityTargetScope == null || densityTargetScope != permit.worldScope()) {
                 return null;
             }
             // Attach once per dispatcher (idempotent; sticky-fail). The identity is the
@@ -297,7 +382,7 @@ public final class GpuClimatePrefetch {
             if (denDisp.climateSliceLen() != plan.expectLen()) {
                 return null;
             }
-            dkey = GpuBatchStore.key(pos, ext.ox, ext.oy, ext.oz, ext.sx, ext.sy, ext.sz,
+            dkey = GpuBatchStore.key(pos, permit.worldScope(), ext.ox, ext.oy, ext.oz, ext.sx, ext.sy, ext.sz,
                     ext.dimX, ext.dimY, ext.dimZ);
             if (GpuBatchStore.contains(dkey) || !GpuBatchStore.markPending(dkey)) {
                 // Density already deposited / in flight for this chunk (re-upgrade) —
@@ -308,8 +393,15 @@ public final class GpuClimatePrefetch {
             final GpuBatchStore.Key fdkey = dkey;
 
             final int denExpect = denFused.rootCount() * ext.gridLen;
-            final GpuChunkBatcher.CombinedHandle handle = batcher.submitCombined(
-                    ext.ox, ext.oy, ext.oz, ext.sx, ext.sy, ext.sz, ext.dimX, ext.dimY, ext.dimZ);
+            final GpuChunkBatcher.CombinedHandle[] handleHolder = new GpuChunkBatcher.CombinedHandle[1];
+            if (!GpuWorldgenPolicy.dispatchIfAuthorizedInScope(permit,
+                    GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH, densityTargetScope,
+                    () -> handleHolder[0] = batcher.submitCombined(
+                            ext.ox, ext.oy, ext.oz, ext.sx, ext.sy, ext.sz, ext.dimX, ext.dimY, ext.dimZ))) {
+                GpuBatchStore.clearPending(dkey);
+                return null;
+            }
+            final GpuChunkBatcher.CombinedHandle handle = handleHolder[0];
             if (handle == null) {
                 GpuBatchStore.clearPending(dkey);
                 return null;
@@ -320,8 +412,12 @@ public final class GpuClimatePrefetch {
             // consumer falls back to per-chunk field production when the holder is null).
             handle.density().whenComplete((grids, err) -> {
                 try {
-                    if (err == null && grids != null && grids.length == denExpect) {
-                        GpuBatchStore.put(fdkey, new GpuBatchStore.Stored(denFused, ext, grids, null));
+                    if (err == null && grids != null && grids.length == denExpect
+                            && GpuWorldgenPolicy.isAuthorizedInScope(permit,
+                            GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH, densityTargetScope)
+                            && fdkey.worldScope() == permit.worldScope()) {
+                        GpuBatchStore.put(fdkey, new GpuBatchStore.Stored(permit.worldScope(),
+                                denFused, ext, grids, null, null, null));
                         GpuFillStats.recordBatchPrefetch();
                     } else {
                         GpuFillStats.recordBatchPrefetchFailed();
@@ -341,15 +437,35 @@ public final class GpuClimatePrefetch {
             Completable prefetch = Completable.create(emitter -> {
                 handle.climate().whenComplete((grids, err) -> {
                     resolved.set(true);
+                    boolean stored = false;
+                    boolean contextRejected = false;
                     try {
-                        if (err == null && grids != null && grids.length == plan.expectLen()) {
-                            GpuClimateStore.put(plan.key(),
-                                    new GpuClimateStore.Stored(plan.key().fused(), grids));
-                            GpuFillStats.recordClimatePrefetch();
+                        if (err == null && grids != null && grids.length == plan.expectLen()
+                                && BiomeClimateCache.isCurrentBatchPlan(plan)) {
+                            if (GpuWorldgenPolicy.isAuthorizedForRouter(permit,
+                                    GpuWorldgenPolicy.DispatchPath.CLIMATE_PREFETCH, plan.sourceRouter())
+                                    && plan.key().worldScope() == permit.worldScope()) {
+                                GpuAuthorizationDiagnostics.record(
+                                        GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REVALIDATED,
+                                        diagnosticBucket);
+                                GpuClimateStore.put(plan.key(),
+                                        new GpuClimateStore.Stored(plan.key().fused(), grids));
+                                GpuFillStats.recordClimatePrefetch();
+                                stored = true;
+                            } else {
+                                contextRejected = true;
+                            }
                         }
                         // On failure we DON'T store: beginChunk counts the miss and
                         // funnels a single-chunk request through the climate drainer.
                     } catch (Throwable ignored) {
+                    }
+                    if (!stored) {
+                        GpuAuthorizationDiagnostics.record(
+                                contextRejected
+                                        ? GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_CONTEXT_REJECTED
+                                        : GpuAuthorizationDiagnostics.Event.CLIMATE_PREFETCH_RESULT_REJECTED,
+                                diagnosticBucket);
                     }
                     try {
                         emitter.onComplete();

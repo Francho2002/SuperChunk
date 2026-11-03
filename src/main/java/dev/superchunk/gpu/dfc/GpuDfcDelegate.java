@@ -108,23 +108,62 @@ public final class GpuDfcDelegate {
      * routing is disabled, the backend went away, lengths mismatch, or the GPU
      * eval faults. When it returns false the caller records a CPU batch.
      */
-    public boolean fill(double[] densities, int[] x, int[] y, int[] z) {
+    public boolean fill(double[] densities, int[] x, int[] y, int[] z,
+                        GpuWorldgenPolicy.Permit permit) {
+        if (!GpuAuthorizationDiagnostics.enabled()) {
+            return fillInDiagnosticScope(densities, x, y, z, permit);
+        }
+        GpuAuthorizationDiagnostics.WorldBucket bucket = permit == null || permit.worldScope() == null
+                ? GpuAuthorizationDiagnostics.currentBucket() : permit.worldScope().diagnosticBucket();
+        try (GpuAuthorizationDiagnostics.DiagnosticScope ignored =
+                     GpuAuthorizationDiagnostics.openWorldScope(bucket)) {
+            return fillInDiagnosticScope(densities, x, y, z, permit);
+        }
+    }
+
+    private boolean fillInDiagnosticScope(double[] densities, int[] x, int[] y, int[] z,
+                                          GpuWorldgenPolicy.Permit permit) {
+        GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_FILL_ENTERED);
         final GpuDensityFunction gpu = this.gpu;
-        if (gpu == null || disabled || !OpenCLBackend.isAvailable()) {
-            GpuFillStats.recordCpu(densities.length);
-            return false;   // unresolved deferred delegate (or disabled) -> CPU
+        if (gpu == null) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_UNRESOLVED);
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_COMPILE_FALLBACK);
+            return cpuFallback(densities.length);
+        }
+        GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_RESOLVED);
+        if (disabled) {
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_DISABLED);
+            return cpuFallback(densities.length);
+        }
+        if (!GpuWorldgenPolicy.isAuthorized(permit, GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY)) {
+            GpuWorldgenPolicy.Permit rejectedPermit = permit;
+            GpuAuthorizationDiagnostics.WorldBucket rejectedBucket = rejectedPermit == null
+                    ? GpuAuthorizationDiagnostics.currentBucket() : rejectedPermit.worldScope().diagnosticBucket();
+            GpuAuthorizationDiagnostics.recordDensityAuthorizationFailure(
+                    GpuWorldgenPolicy.diagnoseRejectedGate(false, GpuAuthorizationDiagnostics.enabled(),
+                            () -> rejectedPermit == null
+                                    ? GpuWorldgenPolicy.diagnoseCurrentAuthorization(
+                                    null, null, null, GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY)
+                                    : GpuWorldgenPolicy.diagnosePermitForDiagnostics(
+                                    rejectedPermit, null, null,
+                                    GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY)),
+                    rejectedBucket);
+            return cpuFallback(densities.length);
         }
         int n = densities.length;
         if (x.length < n || y.length < n || z.length < n) {
-            GpuFillStats.recordCpu(n);
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_INPUT_SHAPE_REJECTED);
+            GpuFillStats.recordCpu(densities.length);
             return false;
         }
         try {
             if (disabled) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_DELEGATE_DISABLED);
                 GpuFillStats.recordCpu(n);
                 return false;
             }
             GpuFillStats.recordGpuAttempt();
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_GPU_ATTEMPT);
             // SuperChunk GPU (coalescing): serve this column from the whole-chunk
             // grid cache when possible (computes the entire grid in ONE dispatch on
             // first touch, then slices every later column with NO dispatch). The
@@ -134,7 +173,8 @@ public final class GpuDfcDelegate {
             // [0, n) of x/y/z, so the possibly over-sized pooled arrays are safe
             // to pass unsliced (slicing is deferred until a dispatch is actually
             // taken, keeping gate-rejected fills allocation-free).
-            if (ChunkGridCache.tryServe(gpu, densities, x, y, z, n)) {
+            if (ChunkGridCache.tryServe(gpu, densities, x, y, z, n, permit)) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_GRID_CACHE_SERVED);
                 GpuFillStats.recordGpu(n);
                 return true;
             }
@@ -146,6 +186,7 @@ public final class GpuDfcDelegate {
             // latency-bound dispatches for everything else. Bit-exact: the caller
             // runs the same evalMulti it runs on any other CPU fallback.
             if (!LIVE_SERVE_ALL && n < MIN_DIRECT_DISPATCH_N) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_FILL_SHAPE_REJECTED);
                 GpuFillStats.recordGateReject(n);
                 if (!gateRejectLogged) {
                     gateRejectLogged = true;
@@ -160,18 +201,54 @@ public final class GpuDfcDelegate {
             int[] sx = x.length == n ? x : java.util.Arrays.copyOf(x, n);
             int[] sy = y.length == n ? y : java.util.Arrays.copyOf(y, n);
             int[] sz = z.length == n ? z : java.util.Arrays.copyOf(z, n);
-            boolean ok = gpu.fill(densities, sx, sy, sz);
+            final boolean[] result = {false};
+            GpuWorldgenPolicy.DispatchResult dispatch = GpuWorldgenPolicy.dispatchWithFallbackDetailed(permit,
+                    GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY,
+                    () -> result[0] = gpu.fill(densities, sx, sy, sz),
+                    () -> GpuFillStats.recordCpu(n),
+                    failure -> {
+                        disabled = true;
+                        LOGGER.warn("[SuperChunk-GPU] GPU DF fill threw — disabling GPU for this DF, CPU fallback.",
+                                failure);
+                    });
+            if (!dispatch.dispatched()) {
+                if (dispatch.state() == GpuWorldgenPolicy.DispatchState.AUTHORIZATION_DENIED) {
+                    GpuAuthorizationDiagnostics.recordDensityAuthorizationFailure(
+                            dispatch.authorizationDiagnostic());
+                } else {
+                    // The dispatch result preserves the reason captured at the gate; no second
+                    // authorization read can turn an execution failure into a denial (or vice versa).
+                    GpuAuthorizationDiagnostics.record(
+                            GpuAuthorizationDiagnostics.Event.DENSITY_GPU_FILL_FAILED);
+                    GpuAuthorizationDiagnostics.record(
+                            GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
+                }
+                return false;
+            }
+            boolean ok = result[0];
             if (ok) {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_GPU_FILL_COMPLETED);
                 GpuFillStats.recordGpu(n);
             } else {
+                GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_GPU_FILL_FAILED);
+                GpuAuthorizationDiagnostics.record(
+                        GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
                 GpuFillStats.recordCpu(n);
             }
             return ok;
         } catch (Throwable t) {
             LOGGER.warn("[SuperChunk-GPU] GPU DF fill threw — disabling GPU for this DF, CPU fallback.", t);
             disabled = true;
+            GpuAuthorizationDiagnostics.record(GpuAuthorizationDiagnostics.Event.DENSITY_GPU_FILL_FAILED);
+            GpuAuthorizationDiagnostics.record(
+                    GpuAuthorizationDiagnostics.Event.DENSITY_GPU_EXECUTION_FALLBACK);
             GpuFillStats.recordCpu(n);
             return false;
         }
+    }
+
+    private static boolean cpuFallback(int values) {
+        GpuFillStats.recordCpu(values);
+        return false;
     }
 }

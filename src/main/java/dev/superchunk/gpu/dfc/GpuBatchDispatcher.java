@@ -116,6 +116,7 @@ public final class GpuBatchDispatcher implements AutoCloseable {
     private final String kernelName;
     private final int realBytes;
     private final int rootCount;
+    private final GpuAuthorizationDiagnostics.BatchWorkload workload;
     /** Per-column slots of a hoisted program (0 = standard program, no column kernel). */
     private final int columnSlots;
 
@@ -213,12 +214,14 @@ public final class GpuBatchDispatcher implements AutoCloseable {
 
     private GpuBatchDispatcher(CLProgram program, boolean fp32, int rootCount, int columnSlots,
                                boolean profilingQueues, int depth, String kernelName,
+                               GpuAuthorizationDiagnostics.BatchWorkload workload,
                                long noiseDescMem, long noiseFactorsMem, long nPermMem, long nActiveMem,
                                long nXoMem, long nYoMem, long nZoMem, long nAmpMem) {
         this.program = program;
         this.fp32 = fp32;
         this.profilingQueues = profilingQueues;
         this.kernelName = kernelName;
+        this.workload = workload;
         this.realBytes = fp32 ? Float.BYTES : Double.BYTES;
         this.rootCount = rootCount;
         this.columnSlots = columnSlots;
@@ -312,7 +315,12 @@ public final class GpuBatchDispatcher implements AutoCloseable {
      * close+recompiled). Returns {@code null} on any failure (logged; never throws).
      */
     public static GpuBatchDispatcher compile(List<AstNode> roots) {
-        return compile(roots, null, false);
+        return compile(roots, null, false, GpuAuthorizationDiagnostics.BatchWorkload.OTHER);
+    }
+
+    /** Production compiler entry point for standalone climate batches. */
+    public static GpuBatchDispatcher compileClimate(List<AstNode> roots) {
+        return compile(roots, null, false, GpuAuthorizationDiagnostics.BatchWorkload.CLIMATE);
     }
 
     /**
@@ -325,7 +333,7 @@ public final class GpuBatchDispatcher implements AutoCloseable {
      * fp32, where the standard path is already float).
      */
     public static GpuBatchDispatcher compileClimateF32D(List<AstNode> roots) {
-        return compile(roots, null, true);
+        return compile(roots, null, true, GpuAuthorizationDiagnostics.BatchWorkload.CLIMATE);
     }
 
     /**
@@ -337,10 +345,11 @@ public final class GpuBatchDispatcher implements AutoCloseable {
      * {@code fused == null} (self-test path) never builds the decide chain.
      */
     public static GpuBatchDispatcher compile(List<AstNode> roots, GpuFusedInterpolator fused) {
-        return compile(roots, fused, false);
+        return compile(roots, fused, false, GpuAuthorizationDiagnostics.BatchWorkload.DENSITY);
     }
 
-    private static GpuBatchDispatcher compile(List<AstNode> roots, GpuFusedInterpolator fused, boolean climF32d) {
+    private static GpuBatchDispatcher compile(List<AstNode> roots, GpuFusedInterpolator fused, boolean climF32d,
+                                              GpuAuthorizationDiagnostics.BatchWorkload workload) {
         if (!OpenCLBackend.isAvailable()) {
             return null;
         }
@@ -411,6 +420,7 @@ public final class GpuBatchDispatcher implements AutoCloseable {
             GpuBatchDispatcher d = new GpuBatchDispatcher(program, fp32, multi.rootCount(), multi.columnSlots(),
                     profiling, Math.max(1, configPipelineDepth()),
                     climF32d ? "df_batch_lattice_multichunk_f32d" : KERNEL_NAME,
+                    workload,
                     descMem, factorsMem, permMem, activeMem, xoMem, yoMem, zoMem, ampMem);
             program.logKernelWorkGroupInfo(d.slots[0].kernel, "df_batch_lattice_multichunk (corner)");
             if (multi.columnSlots() > 0) {
@@ -643,6 +653,15 @@ public final class GpuBatchDispatcher implements AutoCloseable {
                                  int strx, int stry, int strz,
                                  int dimX, int dimY, int dimZ,
                                  CompactIds.ChunkAux[] auxes, boolean withClimate) {
+        return enqueueBatch(originsXYZ, K, strx, stry, strz, dimX, dimY, dimZ, auxes, withClimate,
+                GpuAuthorizationDiagnostics.WorldBucket.UNKNOWN);
+    }
+
+    InFlight enqueueBatch(int[] originsXYZ, int K,
+                          int strx, int stry, int strz,
+                          int dimX, int dimY, int dimZ,
+                          CompactIds.ChunkAux[] auxes, boolean withClimate,
+                          GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket) {
         if (originsXYZ == null || K <= 0 || originsXYZ.length < K * 3) {
             return null;
         }
@@ -650,7 +669,8 @@ public final class GpuBatchDispatcher implements AutoCloseable {
         if (n <= 0 || validateSizes(K, n)) {
             return null;
         }
-        return doEnqueue(originsXYZ, K, strx, stry, strz, dimX, dimY, dimZ, n, auxes, withClimate);
+        return doEnqueue(originsXYZ, K, strx, stry, strz, dimX, dimY, dimZ, n, auxes, withClimate,
+                diagnosticBucket == null ? GpuAuthorizationDiagnostics.WorldBucket.UNKNOWN : diagnosticBucket);
     }
 
     /**
@@ -747,7 +767,8 @@ public final class GpuBatchDispatcher implements AutoCloseable {
     private InFlight doEnqueue(int[] originsXYZ, int K,
                                int strx, int stry, int strz,
                                int dimX, int dimY, int dimZ, int n,
-                               CompactIds.ChunkAux[] auxes, boolean withClimate) {
+                               CompactIds.ChunkAux[] auxes, boolean withClimate,
+                               GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket) {
         final int total = K * n;
         final int outElems = K * rootCount * n;
         Slot s = acquireSlot();
@@ -756,6 +777,8 @@ public final class GpuBatchDispatcher implements AutoCloseable {
         }
         boolean ok = false;
         boolean enqueuedAny = false;
+        boolean primaryDispatchRecorded = false;
+        boolean primaryReadbackEnqueued = false;
         InFlight inf = null;
         lifecycleLock.readLock().lock();
         try {
@@ -814,6 +837,8 @@ public final class GpuBatchDispatcher implements AutoCloseable {
                     total, cornerEvtOut)) {
                 program.enqueue1DAsync(s.queue, s.kernel, CLProgram.roundUpGlobal(total), cornerEvtOut);
             }
+            GpuAuthorizationDiagnostics.recordBatchPrimaryEnqueued(workload, diagnosticBucket);
+            primaryDispatchRecorded = true;
 
             // Kick the corner kernel NOW. Everything below (aux staging, 5 uploads, the
             // decide NDRange, 2 readbacks) is enqueue-side host work; without this flush the
@@ -821,7 +846,7 @@ public final class GpuBatchDispatcher implements AutoCloseable {
             // kernel by that staging time. Same reasoning as the trailing flush's comment.
             program.flush(s.queue);
 
-            inf = new InFlight(s, K, rootCount * n, outElems);
+            inf = new InFlight(s, K, rootCount * n, outElems, workload, diagnosticBucket);
             if (cornerEvtOut != null) {
                 inf.cornerEvt = cornerEvtOut[0];
             }
@@ -863,7 +888,10 @@ public final class GpuBatchDispatcher implements AutoCloseable {
             // so the corner read event (last command on the in-order queue) implies
             // the climate slices are in their pinned staging too. Fail-soft: a chain
             // fault sticky-disables it and the batch completes corner-only.
-            if (withClimate && climChainReady && !climChainFailed && s.climKernel != NULL) {
+            if (withClimate && workload == GpuAuthorizationDiagnostics.BatchWorkload.DENSITY
+                    && climChainReady && !climChainFailed && s.climKernel != NULL) {
+                boolean climateKernelRecorded = false;
+                boolean climateReadbackEnqueued = false;
                 try {
                     long climOutL = (long) K * climRootCount * climN;
                     long climTotalL = (long) K * climN;
@@ -892,6 +920,8 @@ public final class GpuBatchDispatcher implements AutoCloseable {
                         climProgram.setArgInt(s.climKernel, a3++, climTotal);
                         climProgram.setArgPointer(s.climKernel, a3, s.climOutMem);
                         climProgram.enqueue1DAsync(s.queue, s.climKernel, CLProgram.roundUpGlobal(climTotal), null);
+                        GpuAuthorizationDiagnostics.recordClimateChainEnqueued(true, diagnosticBucket);
+                        climateKernelRecorded = true;
                         if (fp32) {
                             s.hClimOutF.clear();
                             s.hClimOutF.limit(climOutElems);
@@ -901,12 +931,22 @@ public final class GpuBatchDispatcher implements AutoCloseable {
                             s.hClimOutD.limit(climOutElems);
                             program.enqueueReadAsync(s.queue, s.climOutMem, s.hClimOutD, null);
                         }
+                        climateReadbackEnqueued = true;
                         inf.climAvailable = true;
+                        inf.includesClimate = true;
                         inf.climSliceLen = climRootCount * climN;
                     }
                 } catch (Throwable t) {
                     // The corner path is unaffected (in-order queue; slot buffers only).
                     inf.climAvailable = false;
+                    if (!climateKernelRecorded) {
+                        GpuAuthorizationDiagnostics.recordClimateChainEnqueueFailed(true, diagnosticBucket);
+                    } else if (!climateReadbackEnqueued) {
+                        GpuAuthorizationDiagnostics.recordClimateDispatchWithoutReadbackFailure(
+                                true, diagnosticBucket);
+                    } else {
+                        GpuAuthorizationDiagnostics.recordClimateChainCompletionFailed(true, diagnosticBucket);
+                    }
                     climChainFailed = true;
                     LOGGER.warn("[SuperChunk-GPU] [biome-chain] chained climate enqueue failed — chain sticky-disabled, "
                             + "split climate path resumes.", t);
@@ -926,6 +966,7 @@ public final class GpuBatchDispatcher implements AutoCloseable {
                 s.hOutD.limit(outElems);
                 program.enqueueReadAsync(s.queue, s.outMem, s.hOutD, readEvt);
             }
+            primaryReadbackEnqueued = true;
             inf.readEvent = readEvt[0];
             // Kick the GPU now — without a flush the driver may defer submission
             // until a blocking call, serializing the pipeline right back.
@@ -933,6 +974,9 @@ public final class GpuBatchDispatcher implements AutoCloseable {
             ok = true;
             return inf;
         } catch (Throwable t) {
+            GpuAuthorizationDiagnostics.recordBatchEnqueueFailure(primaryDispatchRecorded,
+                    inf != null && primaryReadbackEnqueued, workload,
+                    inf != null && inf.includesClimate, diagnosticBucket);
             LOGGER.warn("[SuperChunk-GPU] [batch] batched enqueue failed (K={}, M={}).", K, rootCount, t);
             // Drain whatever was partially enqueued so the slot is quiescent before it
             // returns to the pool. MUST run under the read lock (still held here) — a
@@ -996,6 +1040,9 @@ public final class GpuBatchDispatcher implements AutoCloseable {
         private final int k;
         private final int sliceLen;
         private final int outElems;
+        private final GpuAuthorizationDiagnostics.BatchWorkload workload;
+        private final GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket;
+        private boolean includesClimate;
         long readEvent = NULL;
         long decideEvt = NULL;
         long idsReadEvt = NULL;
@@ -1016,12 +1063,17 @@ public final class GpuBatchDispatcher implements AutoCloseable {
         boolean climAvailable;
         int climSliceLen;
         private final AtomicBoolean released = new AtomicBoolean(false);
+        private final AtomicBoolean diagnosticCompletionRecorded = new AtomicBoolean(false);
 
-        private InFlight(Slot slot, int k, int sliceLen, int outElems) {
+        private InFlight(Slot slot, int k, int sliceLen, int outElems,
+                         GpuAuthorizationDiagnostics.BatchWorkload workload,
+                         GpuAuthorizationDiagnostics.WorldBucket diagnosticBucket) {
             this.slot = slot;
             this.k = k;
             this.sliceLen = sliceLen;
             this.outElems = outElems;
+            this.workload = workload;
+            this.diagnosticBucket = diagnosticBucket;
         }
 
         /**
@@ -1029,7 +1081,12 @@ public final class GpuBatchDispatcher implements AutoCloseable {
          * caller must then fail the batch's futures and still {@link #release()}.
          */
         public boolean await() {
-            return CLProgram.waitForEvent(readEvent);
+            try {
+                return recordReadbackResult(CLProgram.waitForEvent(readEvent));
+            } catch (RuntimeException | Error failure) {
+                recordReadbackResult(false);
+                throw failure;
+            }
         }
 
         /**
@@ -1038,7 +1095,21 @@ public final class GpuBatchDispatcher implements AutoCloseable {
          * the second batch in flight.
          */
         public boolean awaitParked() {
-            return AWAIT_POLL_NANOS <= 0L ? this.await() : CLProgram.awaitEventParked(readEvent, AWAIT_POLL_NANOS);
+            try {
+                return recordReadbackResult(AWAIT_POLL_NANOS <= 0L
+                        ? this.await() : CLProgram.awaitEventParked(readEvent, AWAIT_POLL_NANOS));
+            } catch (RuntimeException | Error failure) {
+                recordReadbackResult(false);
+                throw failure;
+            }
+        }
+
+        private boolean recordReadbackResult(boolean completed) {
+            if (diagnosticCompletionRecorded.compareAndSet(false, true)) {
+                GpuAuthorizationDiagnostics.recordBatchReadback(workload, includesClimate, completed,
+                        diagnosticBucket);
+            }
+            return completed;
         }
 
         /** Chunks with a decide-chain id slice this batch (0 = corner-only batch). */

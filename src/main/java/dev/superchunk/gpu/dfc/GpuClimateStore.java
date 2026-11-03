@@ -51,6 +51,7 @@ public final class GpuClimateStore {
     /** Observability. */
     private static final AtomicLong puts = new AtomicLong();
     private static final AtomicLong takes = new AtomicLong();
+    private static final AtomicLong removals = new AtomicLong();
     private static final AtomicLong evictions = new AtomicLong();
 
     private GpuClimateStore() {
@@ -65,7 +66,8 @@ public final class GpuClimateStore {
      * fields from the SAME chunk via the SAME formulas, so a deposit is always found by
      * its own chunk's fill and can never alias another dimension's entry.
      */
-    public record Key(long chunkPosLong, int oyQuart, int dimY, GpuFusedInterpolator fused) {
+    public record Key(GpuWorldgenPolicy.WorldScope worldScope,
+                      long chunkPosLong, int oyQuart, int dimY, GpuFusedInterpolator fused) {
     }
 
     /**
@@ -125,7 +127,7 @@ public final class GpuClimateStore {
     /** Removes an orphaned entry (gen cancelled before consume). Plain grids — nothing to release. */
     public static void remove(Key key) {
         if (key != null && STORE.remove(key) != null) {
-            takes.incrementAndGet();
+            removals.incrementAndGet();
         }
     }
 
@@ -144,6 +146,11 @@ public final class GpuClimateStore {
 
     public static long takes() {
         return takes.get();
+    }
+
+    /** Entries explicitly removed by cancellation/cleanup, separate from successful take(). */
+    public static long removals() {
+        return removals.get();
     }
 
     public static long evictions() {

@@ -19,6 +19,7 @@ import net.minecraft.world.level.levelgen.Aquifer;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseChunk;
+import net.minecraft.world.level.levelgen.RandomState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -219,6 +220,8 @@ public final class CompactConsume {
         Reason reason;
         byte[] ids;
         GpuBatchStore.Key key;
+        GpuBatchStore.Stored deposit;
+        GpuWorldgenPolicy.Permit permit;
         int ox, oy, oz;          // block origin of the id lattice (== chunk origin, minCellY*cellHeight)
         int cellWidth, cellHeight;
         int cellsXZ;             // 16 / cellWidth
@@ -239,7 +242,13 @@ public final class CompactConsume {
      * decides whether/when to {@link GpuBatchStore#remove}). Returns a ctx whose
      * {@link Ctx#reason} is {@link Reason#OK} iff the consume path may run.
      */
-    private static Ctx prepare(ChunkAccess chunk, NoiseChunk nc, int minCellY, int cellCountY) {
+    private static Ctx prepare(NoiseBasedChunkGenerator generator, RandomState randomState,
+                               ChunkAccess chunk, NoiseChunk nc, int minCellY, int cellCountY,
+                               GpuWorldgenPolicy.Permit permit) {
+        if (!GpuWorldgenPolicy.isAuthorizedForTask(permit,
+                GpuWorldgenPolicy.DispatchPath.DENSITY_PREFETCH, generator, randomState, chunk)) {
+            return Ctx.fail(Reason.NO_ENTRY);
+        }
         ChunkPos cp = chunk.getPos();
         if (SharedConstants.debugVoidTerrain(cp)) {
             return Ctx.fail(Reason.DEBUG_VOID);
@@ -265,10 +274,16 @@ public final class CompactConsume {
             // does not model partial sections — original loop.
             return Ctx.fail(Reason.UNALIGNED);
         }
-        GpuBatchStore.Key key = GpuBatchStore.key(cp, ext.ox, ext.oy, ext.oz,
+        GpuBatchStore.Key key = GpuBatchStore.key(cp, permit.worldScope(), ext.ox, ext.oy, ext.oz,
                 ext.sx, ext.sy, ext.sz, ext.dimX, ext.dimY, ext.dimZ);
+        if (key == null || key.worldScope() != permit.worldScope()) {
+            return Ctx.fail(Reason.NO_ENTRY);
+        }
         GpuBatchStore.Stored stored = GpuBatchStore.get(key);
         if (stored == null) {
+            return Ctx.fail(Reason.NO_ENTRY);
+        }
+        if (stored.worldScope() != permit.worldScope()) {
             return Ctx.fail(Reason.NO_ENTRY);
         }
         byte[] ids = stored.ids;
@@ -277,7 +292,7 @@ public final class CompactConsume {
         }
         // The key is position + lattice geometry, which another dimension can share: take only
         // ids decided for this chunk's own dimension (its route), never a same-shaped neighbour's.
-        if (stored.route == null || stored.route != CompactIds.routeFor(nc)) {
+        if (!GpuWorldgenPolicy.sameDepositRoute(CompactIds.routeFor(nc), stored.route)) {
             return Ctx.fail(Reason.ROUTE);
         }
         if (ids.length != 256 * fullY) {
@@ -325,6 +340,8 @@ public final class CompactConsume {
         c.reason = Reason.OK;
         c.ids = ids;
         c.key = key;
+        c.deposit = stored;
+        c.permit = permit;
         c.ox = ext.ox;
         c.oy = ext.oy;
         c.oz = ext.oz;
@@ -338,6 +355,20 @@ public final class CompactConsume {
             c.cellCpu = computeCpuCells(c);
         }
         return c;
+    }
+
+    private static boolean depositStillAuthorized(Ctx ctx, NoiseBasedChunkGenerator generator,
+                                                 RandomState randomState, ChunkAccess chunk) {
+        try {
+            return ctx != null && ctx.key != null && ctx.deposit != null && ctx.permit != null
+                    && GpuWorldgenPolicy.isAuthorizedForTask(ctx.permit,
+                    GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY, generator, randomState, chunk)
+                    && GpuWorldgenPolicy.sameDepositScope(ctx.permit, ctx.key.worldScope())
+                    && ctx.deposit.worldScope() == ctx.key.worldScope()
+                    && GpuBatchStore.get(ctx.key) == ctx.deposit;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     /** Marks every cell containing a beard-sentinel byte (those run the ORIGINAL per-block path). */
@@ -434,9 +465,11 @@ public final class CompactConsume {
      * then cancels the original loop). {@code false} = run the original loop (all
      * fallback reasons counted). Never throws.
      */
-    public static boolean consumeFill(NoiseBasedChunkGenerator gen, ChunkAccess chunk,
-                                      NoiseChunk nc, int minCellY, int cellCountY) {
-        if (!CompactIds.CONSUME) {
+    public static boolean consumeFill(NoiseBasedChunkGenerator gen, RandomState randomState,
+                                      ChunkAccess chunk, NoiseChunk nc, int minCellY, int cellCountY) {
+        GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.currentPermit();
+        if (!CompactIds.CONSUME || !GpuWorldgenPolicy.isAuthorizedForTask(permit,
+                GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY, gen, randomState, chunk)) {
             return false;
         }
         if (disabled) {
@@ -451,9 +484,15 @@ public final class CompactConsume {
             return false;
         }
         try {
-            Ctx ctx = prepare(chunk, nc, minCellY, cellCountY);
+            Ctx ctx = prepare(gen, randomState, chunk, nc, minCellY, cellCountY, permit);
             if (ctx.reason != Reason.OK) {
                 countFallback(ctx.reason);
+                return false;
+            }
+            // The deposit may have been replaced between prepare() and this point. Never take
+            // or mutate the chunk from a payload whose key/value scope or identity changed.
+            if (!depositStillAuthorized(ctx, gen, randomState, chunk)) {
+                countFallback(Reason.NO_ENTRY);
                 return false;
             }
             Mapping m = mapping(gen.generatorSettings().value().defaultBlock());
@@ -462,7 +501,10 @@ public final class CompactConsume {
                 // FAST path: point of no return — take the entry (releases any pooled
                 // field holder), then write. On fault: restore + sticky-disable +
                 // original loop (which now uses the per-chunk grid path).
-                GpuBatchStore.remove(ctx.key);
+                if (!GpuBatchStore.removeIfSame(ctx.key, ctx.deposit)) {
+                    countFallback(Reason.NO_ENTRY);
+                    return false;
+                }
                 try {
                     fastFill(chunk, ctx, m);
                     chunksFast.increment();
@@ -1060,13 +1102,15 @@ public final class CompactConsume {
      * consume the store entry normally — the byte[] reference stays valid) and
      * snapshots the postprocessing list sizes. Never throws.
      */
-    public static void verifyArm(ChunkAccess chunk, NoiseChunk nc, int minCellY, int cellCountY) {
+    public static void verifyArm(NoiseBasedChunkGenerator generator, RandomState randomState,
+                                 ChunkAccess chunk, NoiseChunk nc, int minCellY, int cellCountY) {
         if (!CompactIds.VERIFY) {
             return;
         }
         try {
             VERIFY_TL.remove();
-            Ctx ctx = prepare(chunk, nc, minCellY, cellCountY);
+            GpuWorldgenPolicy.Permit permit = GpuWorldgenPolicy.currentPermit();
+            Ctx ctx = prepare(generator, randomState, chunk, nc, minCellY, cellCountY, permit);
             if (ctx.reason != Reason.OK) {
                 vSkipped.increment();
                 countFallback(ctx.reason);
@@ -1092,7 +1136,7 @@ public final class CompactConsume {
      * SHIPPED states (the hybrid runs the original machinery there), all other cells
      * use the byte-mapped states. Zero divergence required.
      */
-    public static void verifyCompare(NoiseBasedChunkGenerator gen, ChunkAccess chunk) {
+    public static void verifyCompare(NoiseBasedChunkGenerator gen, RandomState randomState, ChunkAccess chunk) {
         if (!CompactIds.VERIFY) {
             return;
         }
@@ -1103,6 +1147,13 @@ public final class CompactConsume {
         VERIFY_TL.remove();
         try {
             Ctx ctx = vc.ctx;
+            if (ctx == null || !GpuWorldgenPolicy.isAuthorizedForTask(ctx.permit,
+                    GpuWorldgenPolicy.DispatchPath.DIRECT_DENSITY, gen, randomState, chunk)
+                    || !GpuWorldgenPolicy.sameDepositScope(ctx.permit,
+                    ctx.key == null ? null : ctx.key.worldScope())
+                    || ctx.deposit == null || ctx.deposit.worldScope() != ctx.key.worldScope()) {
+                return;
+            }
             Mapping m = mapping(gen.generatorSettings().value().defaultBlock());
             long mismatchesBefore = mismatchTotal();
             int chunkFlips = 0;

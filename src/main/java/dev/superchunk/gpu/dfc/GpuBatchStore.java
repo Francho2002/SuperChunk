@@ -82,7 +82,8 @@ public final class GpuBatchStore {
      * geometry AND position, the batched dispatch is a pure function of (geometry, position,
      * primary fused group), so both compute bit-identical grids and a shared slot is provably safe.
      */
-    public record Key(ChunkPos pos, int sx, int sy, int sz, int oy, int dimX, int dimY, int dimZ) {
+    public record Key(GpuWorldgenPolicy.WorldScope worldScope, ChunkPos pos,
+                      int sx, int sy, int sz, int oy, int dimX, int dimY, int dimZ) {
     }
 
     /**
@@ -93,9 +94,15 @@ public final class GpuBatchStore {
      * {@code ox}/{@code oz} are accepted for symmetry with {@link Extent#matches} but excluded
      * from the key (pos-derived; {@code pos} already carries them).
      */
-    public static Key key(ChunkPos pos, int ox, int oy, int oz, int sx, int sy, int sz,
+    public static Key key(ChunkPos pos, GpuWorldgenPolicy.WorldScope worldScope,
+                          int ox, int oy, int oz, int sx, int sy, int sz,
                           int dimX, int dimY, int dimZ) {
-        return new Key(pos, sx, sy, sz, oy, dimX, dimY, dimZ);
+        return worldScope == null ? null : new Key(worldScope, pos, sx, sy, sz, oy, dimX, dimY, dimZ);
+    }
+
+    static boolean payloadScopeMatches(Key key, Stored payload) {
+        return key != null && payload != null && key.worldScope() != null
+                && payload.worldScope() == key.worldScope();
     }
 
     /** Whether an entry is currently held for {@code key} (idempotency guard for re-submits). */
@@ -136,7 +143,7 @@ public final class GpuBatchStore {
      * existed for {@code key}, its pooled field holder (if any) is returned to the pool.
      */
     public static void put(Key key, Stored grids) {
-        if (key == null || grids == null) {
+        if (!payloadScopeMatches(key, grids)) {
             return;
         }
         Stored prev = STORE.put(key, grids);
@@ -170,6 +177,19 @@ public final class GpuBatchStore {
             takes.incrementAndGet();
         }
         return s;
+    }
+
+    /** Removes the entry only if it is still the exact payload validated by a consumer. */
+    public static boolean removeIfSame(Key key, Stored expected) {
+        if (!payloadScopeMatches(key, expected)) {
+            return false;
+        }
+        if (!STORE.remove(key, expected)) {
+            return false;
+        }
+        takes.incrementAndGet();
+        releaseField(expected);
+        return true;
     }
 
     /**
@@ -253,6 +273,8 @@ public final class GpuBatchStore {
      * {@code [k*gridLen ..]}, matching {@link GpuFusedInterpolator#members()} order).
      */
     public static final class Stored {
+        /** Exact world-generation scope that authorized the request which produced this payload. */
+        private final GpuWorldgenPolicy.WorldScope worldScope;
         final GpuFusedInterpolator fused;
         final Extent ext;
         final double[] grids;
@@ -282,17 +304,27 @@ public final class GpuBatchStore {
         final Object route;
 
         public Stored(GpuFusedInterpolator fused, Extent ext, double[] grids, OnDeviceFieldPool.Holder field) {
-            this(fused, ext, grids, field, null, null);
+            this(null, fused, ext, grids, field, null, null);
         }
 
         public Stored(GpuFusedInterpolator fused, Extent ext, double[] grids, OnDeviceFieldPool.Holder field,
                       byte[] ids, Object route) {
+            this(null, fused, ext, grids, field, ids, route);
+        }
+
+        public Stored(GpuWorldgenPolicy.WorldScope worldScope, GpuFusedInterpolator fused, Extent ext,
+                      double[] grids, OnDeviceFieldPool.Holder field, byte[] ids, Object route) {
+            this.worldScope = worldScope;
             this.fused = fused;
             this.ext = ext;
             this.grids = grids;
             this.field = field;
             this.ids = ids;
             this.route = ids == null ? null : route;
+        }
+
+        public GpuWorldgenPolicy.WorldScope worldScope() {
+            return worldScope;
         }
     }
 
