@@ -272,7 +272,7 @@ public final class ProjectExplosiveMixinContractTest {
 
     private static void verifyScaleMixinState() throws Exception {
         ClassNode mixin = readClasspathClass("dev/superchunk/mixin/MixinProjectExplosiveNuclearTerrainScale.class");
-        check(mixin.interfaces.contains("dev/superchunk/mixin/ProjectExplosiveTerrainScaleState"),
+        check(mixin.interfaces.contains("dev/superchunk/diag/projectexplosive/ProjectExplosiveTerrainScaleState"),
                 "the scale Mixin exposes primitive state to diagnostics");
         check(field(mixin, "superchunk$originalTerrainTarget", "D")
                         && field(mixin, "superchunk$effectiveTerrainTarget", "D"),

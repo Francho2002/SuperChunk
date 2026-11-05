@@ -4,6 +4,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
 import dev.superchunk.diag.projectexplosive.ProjectExplosiveNuclearTerrainScale;
+import dev.superchunk.diag.projectexplosive.ProjectExplosiveTerrainScaleState;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;

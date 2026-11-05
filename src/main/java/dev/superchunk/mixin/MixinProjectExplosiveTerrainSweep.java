@@ -4,6 +4,7 @@ import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics;
+import dev.superchunk.diag.projectexplosive.ProjectExplosiveTerrainScaleState;
 import dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.Scope;
 import dev.superchunk.diag.projectexplosive.ProjectExplosivePerfDiagnostics.ScopeKind;
 import net.minecraft.core.BlockPos;
